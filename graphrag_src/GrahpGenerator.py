@@ -1,12 +1,21 @@
-import ollama
-from datasets import load_from_disk, Dataset
-
-from tqdm import tqdm
-from EntityRelationExtractor import EntityRelationExtractor
-from typing import List, Dict, Optional, Any
 import asyncio
+import logging
+from typing import Any, Dict, List, Optional, cast
+
+import igraph as ig
+import ollama
+import pandas as pd
+import polars as pl
+import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
+from datasets import Dataset, load_from_disk
+from tqdm import tqdm
+
+try:
+    from .EntityRelationExtractor import EntityRelationExtractor
+except ImportError:
+    from EntityRelationExtractor import EntityRelationExtractor
 
 
 class GraphGenerator:
@@ -29,6 +38,11 @@ class GraphGenerator:
         ) -> None:
         self.extractor=EntityRelationExtractor(chunks_path=self.CHUNKS_PATH)
         self.desc_model=description_model_name
+        self.logger = logging.getLogger(__name__)
+
+    @staticmethod
+    def _format_rss_mb() -> float:
+        return psutil.Process().memory_info().rss / (1024 * 1024)
     
     
     
@@ -50,6 +64,7 @@ class GraphGenerator:
             if entity_db_path is None:
                 raise ValueError("Either entity_db or entity_db_path must be provided")
             entity_db = pq.read_table(entity_db_path).to_pydict()
+        assert entity_db is not None
 
         model = self.desc_model or "llama3.1:8b-instruct-q4_K_M"
 
@@ -75,9 +90,9 @@ class GraphGenerator:
             nonlocal writer, buffer
             if not buffer:
                 return
-            if not force and len(buffer) < flush_every:
-                return
             async with write_lock:
+                if not force and len(buffer) < flush_every:
+                    return
                 batch = buffer
                 buffer = []
             table = pa.table({
@@ -87,7 +102,7 @@ class GraphGenerator:
                 "description":    [r["description"]    for r in batch],
             }, schema=self.ENTITY_SCHEMA)
             if writer is None:
-                writer = pq.ParquetWriter(output_path, self.ENTITY_SCHEMA, compression="snappy")
+                writer = pq.ParquetWriter(output_path, self.ENTITY_SCHEMA, compression="zstd")
             writer.write_table(table)
 
         # ── Producer ──────────────────────────────────────────────────────────
@@ -100,7 +115,9 @@ class GraphGenerator:
                 for batch in self.extractor.load_chunks().iter(chunk_batch_size):
                     if not needs_more:
                         break
-                    for record in batch:
+                    batch_dict = cast(dict[str, list[Any]], batch)
+                    records = [dict(zip(batch_dict.keys(), values)) for values in zip(*batch_dict.values())]
+                    for record in records:
                         eid = record["id"]
                         if eid in needs_more:
                             bucket = context_chunks[eid]
@@ -163,5 +180,55 @@ class GraphGenerator:
 
         return output_path
     
-    def _generate_graph(self,entity_db):
-        
+    def _load_parquet_frame(self, path: str, columns: List[str]) -> pl.DataFrame:
+        schema = set(pl.read_parquet_schema(path).keys())
+        missing_columns = [column for column in columns if column not in schema]
+        if missing_columns:
+            raise KeyError(f"{path} is missing required columns: {missing_columns}")
+        return pl.read_parquet(path, columns=columns)
+
+    def _generate_graph(self, entity_db_path: str, relation_db_path: str) -> ig.Graph:
+        self.logger.info(
+            "Graph construction start: rss=%.1f MB entity_db=%s relation_db=%s",
+            self._format_rss_mb(),
+            entity_db_path,
+            relation_db_path,
+        )
+        vertex_frame = self._load_parquet_frame(entity_db_path, ["id", "canonical_name", "label"])
+        self.logger.info(
+            "Loaded vertex frame: rows=%d cols=%d rss=%.1f MB",
+            vertex_frame.height,
+            vertex_frame.width,
+            self._format_rss_mb(),
+        )
+        edge_frame = (
+            self._load_parquet_frame(relation_db_path, ["head_id", "tail_id", "relation", "score"])
+            .rename({"head_id": "source", "tail_id": "target"})
+            .group_by(["source", "target"])
+            .agg(
+                pl.len().alias("weight"),
+                pl.col("relation").drop_nulls().unique().sort().alias("relations"),
+                pl.col("relation").drop_nulls().n_unique().alias("relation_count"),
+                pl.col("score").mean().alias("score_mean"),
+            )
+            .with_columns(pl.col("relations").list.join("|"))
+        )
+        self.logger.info(
+            "Prepared edge frame: rows=%d cols=%d rss=%.1f MB",
+            edge_frame.height,
+            edge_frame.width,
+            self._format_rss_mb(),
+        )
+
+        self.logger.info("Converting frames to pandas for igraph: rss=%.1f MB", self._format_rss_mb())
+        vertex_pdf = vertex_frame.rename({"id": "name"}).to_pandas()
+        edge_pdf = edge_frame.to_pandas()
+        self.logger.info(
+            "Converted to pandas: vertex_rows=%d edge_rows=%d rss=%.1f MB",
+            len(vertex_pdf),
+            len(edge_pdf),
+            self._format_rss_mb(),
+        )
+
+        self.logger.info("Building igraph Graph.DataFrame: rss=%.1f MB", self._format_rss_mb())
+        return ig.Graph.DataFrame(edge_pdf, directed=False, vertices=vertex_pdf, use_vids=False)
