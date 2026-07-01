@@ -1,5 +1,6 @@
 from collections import defaultdict
 import logging
+import os
 
 from datasets import IterableDataset, load_dataset, load_from_disk, Dataset, DatasetDict
 from typing import List, Dict, Optional, Any
@@ -146,10 +147,10 @@ class EntityRelationExtractor:
         del self.ner_model
         self.logger.info("Finished chunk generation and released ner_model")
 
-    def load_chunks(self) -> (Dataset | DatasetDict):
+    def load_chunks(self) -> (Dataset | IterableDataset):
         self.logger.info("Loading chunks from %s", self.chunks_path)
         if self.chunks_path=="wiki_dpr_compressed":
-            ds = load_dataset("wiki_dpr", name="psgs_w100.nq.compressed", split="train")
+            ds = load_dataset("wiki_dpr", name="psgs_w100.nq.compressed", split="train", with_index=False)
         else:
             ds = load_from_disk(self.chunks_path)
         self.logger.info("Loaded chunks: %s", getattr(ds, '__class__', type(ds)))
@@ -334,6 +335,30 @@ class EntityRelationExtractor:
         
         return entity_db, entity_map
     
+    def _index_relations(self, relations_path: str, entity_map: Dict[str, str]) -> None:
+        lazy_df = (
+            pl.scan_parquet(relations_path)
+            .with_columns(
+                pl.col("head").str.strip_chars(),
+                pl.col("tail").str.strip_chars(),
+            )
+            .with_columns(
+                pl.col("head").replace_strict(entity_map, default=None).alias("head_id"),
+                pl.col("tail").replace_strict(entity_map, default=None).alias("tail_id"),
+            )
+            .filter(pl.col("head_id").is_not_null() & pl.col("tail_id").is_not_null())
+        )
+    
+        temp_path = f"{relations_path}.tmp"
+        try:
+            # Write to temporary file
+            lazy_df.sink_parquet(temp_path)
+            os.replace(temp_path, relations_path)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
+    
     # generation logic
     def generate(self, dataset_path: str = "wiki_dpr_compressed"):
         """
@@ -385,25 +410,19 @@ class EntityRelationExtractor:
 
         Returns
         -------
-        tuple
-            A 2-tuple ``(entity_db, entity_map)`` where:
 
-            - ``entity_db`` : Dict[str, Dict]
-                Mapping from generated entity id (string) to a dictionary with
-                the following keys:
-                  - ``id``: entity identifier (e.g. "E0000001")
-                  - ``label``: entity type label (string)
-                  - ``canonical_name``: chosen canonical surface form (string)
-                  - ``surface_forms``: list of observed surface form strings
-                  - ``source_chunks``: list of chunk ids where the entity was seen
-
-            - ``entity_map`` : Dict[str, str]
-                Mapping from a surface form string (as observed in the raw
-                extractions) to the canonical entity id in ``entity_db``.
+        - ``entity_db`` : Dict[str, Dict]
+            Mapping from generated entity id (string) to a dictionary with
+            the following keys:
+                - ``id``: entity identifier (e.g. "E0000001")
+                - ``label``: entity type label (string)
+                - ``canonical_name``: chosen canonical surface form (string)
+                - ``surface_forms``: list of observed surface form strings
+                - ``source_chunks``: list of chunk ids where the entity was seen
 
         Example
         -------
-        >>> entity_db, entity_map = extractor.generate("wiki_dpr_compressed")
+        >>> entity_db = extractor.generate("wiki_dpr_compressed")
         >>> entity_db["E0000001"]["canonical_name"]
         'Barack Obama'
 
@@ -453,8 +472,10 @@ class EntityRelationExtractor:
 
         unique = self._get_unique_entity_strings(self.ENTITIES_PATH)
         entity_db, entity_map = self._merge_entities(unique)
+        self._index_relations(self.RELATIONS_PATH, entity_map)
+        self.logger.info("Extraction pipeline completed successfully")
         
-        return entity_db, entity_map
+        return entity_db
         
         
         

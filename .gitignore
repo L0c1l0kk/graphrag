@@ -1,2 +1,3 @@
 /.pytest_cache
 /.vscode
+graphrag_src/__pycache__
