@@ -43,7 +43,6 @@ class EntityRelationExtractor:
         ("doc_id",   pa.string()),
         ("text",     pa.string()),
         ("label",    pa.string()),
-        ("score",    pa.float32()),
         ])
 
     _RELATION_SCHEMA = pa.schema([
@@ -54,7 +53,6 @@ class EntityRelationExtractor:
         ("relation",  pa.string()),
         ("tail",      pa.string()),
         ("tail_type", pa.string()),
-        ("score",     pa.float32()),
         ])
 
     def __init__(
@@ -456,13 +454,13 @@ class EntityRelationExtractor:
                     cid, did = result["chunk_id"], result["doc_id"]
                     entity_rows.extend(
                         {"chunk_id": cid, "doc_id": did, "text": e["text"],
-                        "label": e["label"], "score": e["score"]}
+                        "label": e["label"]}
                         for e in result["entities"]
                     )
                     relation_rows.extend(
                         {"chunk_id": cid, "doc_id": did, "head": r["head"],
                         "head_type": r.get("head_type") or r.get("head_label", ""), "relation": r["relation"],
-                        "tail": r["tail"], "tail_type": r.get("tail_type") or r.get("tail_label", ""), "score": r["score"]}
+                        "tail": r["tail"], "tail_type": r.get("tail_type") or r.get("tail_label", "")}
                         for r in result["relations"]
                     )
                 if len(entity_rows) >= FLUSH_AT or len(relation_rows) >= FLUSH_AT:

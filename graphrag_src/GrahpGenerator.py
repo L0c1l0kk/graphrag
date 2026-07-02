@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import Dataset, load_from_disk
 from tqdm import tqdm
+import os
 
 try:
     from .EntityRelationExtractor import EntityRelationExtractor
@@ -20,13 +21,16 @@ except ImportError:
 
 class GraphGenerator:
     
+    ENTITIES_PATH="data/entities_with_descriptions"
+    RELATIONS_PATH="data/relations"
+    
     CHUNKS_PATH="data/chunks_arrow"
-    ENTITY_SCHEMA = pa.schema([
+    _ENTITY_SCHEMA = pa.schema([
             pa.field("id",             pa.string()),
             pa.field("canonical_name", pa.string()),
             pa.field("label",          pa.string()),
             pa.field("description",    pa.string()),
-        ])
+        ]) # this changes after clustering
     
     def __init__(
         self,
@@ -45,7 +49,7 @@ class GraphGenerator:
         return psutil.Process().memory_info().rss / (1024 * 1024)
     
     
-    
+    # TODO Move this to EntityRelationExtractor, it makes more sense there
     async def _generate_entity_descriptions(
         self,
         output_path: str,
@@ -100,9 +104,9 @@ class GraphGenerator:
                 "canonical_name": [r["canonical_name"] for r in batch],
                 "label":          [r["label"]          for r in batch],
                 "description":    [r["description"]    for r in batch],
-            }, schema=self.ENTITY_SCHEMA)
+            }, schema=self._ENTITY_SCHEMA)
             if writer is None:
-                writer = pq.ParquetWriter(output_path, self.ENTITY_SCHEMA, compression="zstd")
+                writer = pq.ParquetWriter(output_path, self._ENTITY_SCHEMA, compression="zstd")
             writer.write_table(table)
 
         # ── Producer ──────────────────────────────────────────────────────────
@@ -202,14 +206,13 @@ class GraphGenerator:
             self._format_rss_mb(),
         )
         edge_frame = (
-            self._load_parquet_frame(relation_db_path, ["head_id", "tail_id", "relation", "score"])
+            self._load_parquet_frame(relation_db_path, ["head_id", "tail_id", "relation"])
             .rename({"head_id": "source", "tail_id": "target"})
             .group_by(["source", "target"])
             .agg(
                 pl.len().alias("weight"),
                 pl.col("relation").drop_nulls().unique().sort().alias("relations"),
                 pl.col("relation").drop_nulls().n_unique().alias("relation_count"),
-                pl.col("score").mean().alias("score_mean"),
             )
             .with_columns(pl.col("relations").list.join("|"))
         )
@@ -232,3 +235,76 @@ class GraphGenerator:
 
         self.logger.info("Building igraph Graph.DataFrame: rss=%.1f MB", self._format_rss_mb())
         return ig.Graph.DataFrame(edge_pdf, directed=False, vertices=vertex_pdf, use_vids=False)
+    
+    def _save_joined_column(
+        self,
+        path: str,
+        join_df: pl.DataFrame,
+        left_on: str,
+        right_on: str,
+        value_col: str,
+        new_column_name: str,
+    ) -> None:
+        """Join one column from ``join_df`` into the parquet file at ``path``.
+
+        New schema after clustering:
+
+            pa.schema([
+                pa.field("id",             pa.string()),
+                pa.field("canonical_name", pa.string()),
+                pa.field("label",          pa.string()),
+                pa.field("description",    pa.string()),
+                pa.field("cluster_id",     pa.int64()),
+            ])
+
+        The file is rewritten atomically by writing to a temporary parquet file
+        first and then replacing the original on success.
+        """
+        self.logger.info(
+            "Saving new column '%s' to %s via join on '%s': rss=%.1f MB",
+            new_column_name,
+            path,
+            left_on,
+            self._format_rss_mb(),
+        )
+        lazy_df = pl.scan_parquet(path).join(
+            join_df.lazy().select([right_on, value_col]).rename({value_col: new_column_name}),
+            left_on=left_on,
+            right_on=right_on,
+            how="left",
+        )
+        temp_path = f"{path}.tmp"
+        try:
+            lazy_df.sink_parquet(temp_path)
+            os.replace(temp_path, path)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
+        
+    def _compute_clusters(self, graph: ig.Graph) -> None:
+        self.logger.info("Computing clusters: rss=%.1f MB", self._format_rss_mb())
+        
+        clustering = graph.community_leiden(
+            objective_function="modularity",
+            n_iterations=2,
+            weights=graph.es["weight"] if "weight" in graph.es.attributes() else None,
+        )
+        
+        entity_cluster_df = pl.DataFrame({
+            "id": graph.vs["name"],
+            "cluster_id": clustering.membership,
+        })
+        
+        self._save_joined_column(
+            self,
+            path=self.ENTITIES_PATH,
+            join_df=entity_cluster_df,
+            left_on="id",
+            right_on="id",
+            value_col="cluster_id",
+            new_column_name="cluster_id",
+        )
+        
+    def _generate_community_descriptions(self, entity_db_path: str) -> None:
+        pass
