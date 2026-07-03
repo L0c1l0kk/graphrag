@@ -365,7 +365,7 @@ class EntityRelationExtractor:
         return lazy_df
     
     # generation logic
-    def generate(self, dataset_path: str = "wiki_dpr", batch_size: int = 256):
+    def generate(self, dataset_path: str = "wiki_dpr", batch_size: int = 1024):
         """
         Run extraction over a dataset and produce deduplicated entity and relation databases.
 
