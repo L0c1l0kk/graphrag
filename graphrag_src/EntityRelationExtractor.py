@@ -236,8 +236,23 @@ class EntityRelationExtractor:
 # Deduplication and normalization using polars
 
     def _rows_to_table(self, rows: list[dict], schema: pa.Schema) -> pa.Table:
+        def _coerce_scalar(value: Any) -> Any:
+            if isinstance(value, dict):
+                for key in ("text", "label", "name", "value", "id"):
+                    nested = value.get(key)
+                    if nested is not None:
+                        return nested
+                return str(value)
+            return value
+
         return pa.table(
-            {f.name: pa.array([r[f.name] for r in rows], type=f.type) for f in schema},
+            {
+                field.name: pa.array(
+                    [_coerce_scalar(row[field.name]) for row in rows],
+                    type=field.type,
+                )
+                for field in schema
+            },
             schema=schema,
         )
 
@@ -365,7 +380,7 @@ class EntityRelationExtractor:
         return lazy_df
     
     # generation logic
-    def generate(self, dataset_path: str = "wiki_dpr", batch_size: int = 1024):
+    def generate(self, dataset_path: str = "wiki_dpr", batch_size: int = 400):
         """
         Run extraction over a dataset and produce deduplicated entity and relation databases.
 
