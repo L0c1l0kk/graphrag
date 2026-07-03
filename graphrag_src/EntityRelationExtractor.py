@@ -39,13 +39,13 @@ class EntityRelationExtractor:
     RELATIONS_PATH="data/relations"
     
     _ENTITY_SCHEMA = pa.schema([
-        ("chunk_id", pa.int64()),
+        ("chunk_id", pa.string()),
         ("text",     pa.string()),
         ("label",    pa.string()),
         ])
 
     _RELATION_SCHEMA = pa.schema([
-        ("chunk_id",  pa.int64()),
+        ("chunk_id",  pa.string()),
         ("head",      pa.string()),
         ("head_type", pa.string()),
         ("relation",  pa.string()),
@@ -117,7 +117,7 @@ class EntityRelationExtractor:
         chunk_id = 0
         for doc in tqdm(dataset,desc="Chunking"):
             for chunk in self._chunk_text(doc["text"]):
-                yield {"id": chunk_id, "text": chunk}
+                yield {"id": str(chunk_id), "text": chunk}
                 chunk_id += 1
         self._n_chunks = chunk_id+1
 
