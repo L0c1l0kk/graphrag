@@ -92,6 +92,7 @@ class EntityRelationExtractor:
         self.threshold = threshold
         self.relation_threshold = relation_threshold
         self.max_entities_per_chunk = max_entities_per_chunk
+        self._n_chunks=0
         # module-level logger
         self.logger = logging.getLogger(__name__)
         if not logging.getLogger().handlers:
@@ -118,6 +119,7 @@ class EntityRelationExtractor:
             for chunk in self._chunk_text(doc["text"]):
                 yield {"id": chunk_id, "text": chunk}
                 chunk_id += 1
+        self._n_chunks = chunk_id+1
 
     def _generate_chunks(self, path: str, output_dir:str) -> None:
         """
@@ -360,7 +362,7 @@ class EntityRelationExtractor:
         return lazy_df
     
     # generation logic
-    def generate(self, dataset_path: str = "wiki_dpr"):
+    def generate(self, dataset_path: str = "wiki_dpr", batch_size: int = 256):
         """
         Run extraction over a dataset and produce deduplicated entity and relation databases.
 
@@ -456,7 +458,7 @@ class EntityRelationExtractor:
                     self.logger.info("Flushing %d relation rows to %s", len(relation_rows), self.RELATIONS_PATH)
                     relation_rows.clear()
 
-            for batch in tqdm(chunks.iter(batch_size=256), desc="Extracting"):
+            for batch in tqdm(chunks.iter(batch_size=batch_size), total=self._n_chunks/batch_size, desc="Extracting"):
                 records = [dict(zip(batch.keys(), vals)) for vals in zip(*batch.values())]
                 for result in self._process_batch(records):
                     cid = result["chunk_id"]
