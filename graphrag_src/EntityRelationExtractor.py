@@ -149,8 +149,11 @@ class EntityRelationExtractor:
         self.logger.info("Loading chunks from %s", self.chunks_path)
         if self.chunks_path=="wiki_dpr":
             ds = load_dataset("facebook/wiki_dpr", name="psgs_w100.nq.no_index.no_embeddings", split="train")
+            self._n_chunks=len(ds)
         else:
             ds = load_from_disk(self.chunks_path)
+            self._n_chunks=len(ds)
+            #TODO make this work for IterableDataset
         self.logger.info("Loaded chunks: %s", getattr(ds, '__class__', type(ds)))
         return ds
     # Extraction
