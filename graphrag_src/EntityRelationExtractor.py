@@ -133,7 +133,7 @@ class EntityRelationExtractor:
         self.logger.info("Using device: %s", device)
         
         # add argument and description in generate
-        if path=="wiki_dpr_compressed":
+        if path=="wiki_dpr":
             self.logger.info("Dataset %s already chunked; skipping generation", path)
             return
         else:
@@ -147,8 +147,8 @@ class EntityRelationExtractor:
 
     def load_chunks(self) -> (Dataset | IterableDataset):
         self.logger.info("Loading chunks from %s", self.chunks_path)
-        if self.chunks_path=="wiki_dpr_compressed":
-            ds = load_dataset("wiki_dpr", name="psgs_w100.nq.compressed", split="train", with_index=False)
+        if self.chunks_path=="wiki_dpr":
+            ds = load_dataset("facebook/wiki_dpr", name="psgs_w100.nq.no_index.no_embeddings", split="train")
         else:
             ds = load_from_disk(self.chunks_path)
         self.logger.info("Loaded chunks: %s", getattr(ds, '__class__', type(ds)))
@@ -322,18 +322,33 @@ class EntityRelationExtractor:
                     "id":             eid,
                     "label":          label,
                     "canonical_name": canonical_name,
-                    "surface_forms":  surface_forms,
                     "source_chunks":  [chunk_id for m in members for chunk_id in m["chunk_ids"]],
                 }
                 for form in surface_forms:
                     entity_map[form] = eid
 
         del self.embed_model
+        
+        entity_db=[{**entity} for entity in entity_db.values()]
         self.logger.info("Finished merging entities; created %d entity ids", len(entity_db))
         
         return entity_db, entity_map
     
-    def _index_relations(self, relations_path: str, entity_map: Dict[str, str]) -> None:
+    def _save_inplace(self, df: pl.LazyFrame | pl.DataFrame, path: str) -> None:
+        """Save a Polars DataFrame to a Parquet file, overwriting the original."""
+        temp_path = f"{path}.tmp"
+        try:
+            if(df is pl.LazyFrame):
+                df.sink_parquet(temp_path)
+            elif (df is pl.DataFrame):
+                df.write_parquet(temp_path)
+            os.replace(temp_path, path)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
+    
+    def _index_relations(self, relations_path: str, entity_map: Dict[str, str]) -> pl.LazyFrame:
         lazy_df = (
             pl.scan_parquet(relations_path)
             .with_columns(
@@ -346,19 +361,10 @@ class EntityRelationExtractor:
             )
             .filter(pl.col("head_id").is_not_null() & pl.col("tail_id").is_not_null())
         )
-    
-        temp_path = f"{relations_path}.tmp"
-        try:
-            # Write to temporary file
-            lazy_df.sink_parquet(temp_path)
-            os.replace(temp_path, relations_path)
-        except Exception as e:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise e
+        return lazy_df
     
     # generation logic
-    def generate(self, dataset_path: str = "wiki_dpr_compressed"):
+    def generate(self, dataset_path: str = "wiki_dpr"):
         """
         Run extraction over a dataset and produce deduplicated entity and relation databases.
 
@@ -381,7 +387,7 @@ class EntityRelationExtractor:
         ----------
         dataset_path : str, optional
             Path or identifier for the source dataset to extract from. When
-            set to the special value ``"wiki_dpr_compressed"`` the method will
+            set to the special value ``"wiki_dpr"`` the method will
             stream the DPR Wikipedia passages dataset. Otherwise the string is
             passed to ``datasets.load_dataset``/streaming to obtain the input
             documents. Each input document must be a mapping with at least
@@ -420,11 +426,14 @@ class EntityRelationExtractor:
 
         Example
         -------
-        >>> entity_db = extractor.generate("wiki_dpr_compressed")
+        >>> entity_db = extractor.generate("wiki_dpr")
         >>> entity_db["E0000001"]["canonical_name"]
         'Barack Obama'
 
         """
+        if dataset_path == "wiki_dpr":
+            self.chunks_path = "wiki_dpr"
+        
         self.logger.info("Starting extraction pipeline for dataset: %s", dataset_path)
         self._generate_chunks(dataset_path, self.chunks_path)
         chunks = self.load_chunks()
@@ -470,7 +479,10 @@ class EntityRelationExtractor:
 
         unique = self._get_unique_entity_strings(self.ENTITIES_PATH)
         entity_db, entity_map = self._merge_entities(unique)
-        self._index_relations(self.RELATIONS_PATH, entity_map)
+        relations_db = self._index_relations(self.RELATIONS_PATH, entity_map)
+        
+        self._save_inplace(relations_db, self.RELATIONS_PATH)
+        self._save_inplace(pl.from_dict(entity_db), self.ENTITIES_PATH)
         self.logger.info("Extraction pipeline completed successfully")
         
         return entity_db
