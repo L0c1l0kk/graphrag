@@ -40,14 +40,12 @@ class EntityRelationExtractor:
     
     _ENTITY_SCHEMA = pa.schema([
         ("chunk_id", pa.int64()),
-        ("doc_id",   pa.string()),
         ("text",     pa.string()),
         ("label",    pa.string()),
         ])
 
     _RELATION_SCHEMA = pa.schema([
         ("chunk_id",  pa.int64()),
-        ("doc_id",    pa.string()),
         ("head",      pa.string()),
         ("head_type", pa.string()),
         ("relation",  pa.string()),
@@ -118,7 +116,7 @@ class EntityRelationExtractor:
         chunk_id = 0
         for doc in tqdm(dataset,desc="Chunking"):
             for chunk in self._chunk_text(doc["text"]):
-                yield {"id": chunk_id, "doc_id": doc["id"], "text": chunk}
+                yield {"id": chunk_id, "text": chunk}
                 chunk_id += 1
 
     def _generate_chunks(self, path: str, output_dir:str) -> None:
@@ -160,11 +158,10 @@ class EntityRelationExtractor:
         """
         Run joint NER + RE on a list of chunk dicts in a single forward pass.
 
-        Input dicts must contain: id (int), doc_id (str/int), text (str).
+        Input dicts must contain: id (int), text (str).
 
         Returns a list of output dicts with:
           chunk_id  – echoed from input id
-          doc_id    – passthrough
           text      – passthrough
           entities  – list of {text, label, score}
           relations – list of {head, head_label, relation, tail, tail_label, score}
@@ -189,7 +186,6 @@ class EntityRelationExtractor:
 
             results.append({
                 "chunk_id":  item["id"],
-                "doc_id":    item["doc_id"],
                 "text":      item["text"],
                 "entities":  self._format_entities(entities),
                 "relations": self._format_relations(relations),
@@ -442,6 +438,9 @@ class EntityRelationExtractor:
         relation_rows: list[dict] = []
         FLUSH_AT = 500_000
         self.logger.info("Beginning chunk extraction loop with FLUSH_AT=%d", FLUSH_AT)
+    
+        os.makedirs(os.path.dirname(self.ENTITIES_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(self.RELATIONS_PATH), exist_ok=True)
         
         with (
             pq.ParquetWriter(self.ENTITIES_PATH,  self._ENTITY_SCHEMA,   compression="zstd") as ew,
@@ -460,14 +459,13 @@ class EntityRelationExtractor:
             for batch in tqdm(chunks.iter(batch_size=256), desc="Extracting"):
                 records = [dict(zip(batch.keys(), vals)) for vals in zip(*batch.values())]
                 for result in self._process_batch(records):
-                    cid, did = result["chunk_id"], result["doc_id"]
+                    cid = result["chunk_id"]
                     entity_rows.extend(
-                        {"chunk_id": cid, "doc_id": did, "text": e["text"],
-                        "label": e["label"]}
+                        {"chunk_id": cid, "text": e["text"], "label": e["label"]}
                         for e in result["entities"]
                     )
                     relation_rows.extend(
-                        {"chunk_id": cid, "doc_id": did, "head": r["head"],
+                        {"chunk_id": cid, "head": r["head"],
                         "head_type": r.get("head_type") or r.get("head_label", ""), "relation": r["relation"],
                         "tail": r["tail"], "tail_type": r.get("tail_type") or r.get("tail_label", "")}
                         for r in result["relations"]
