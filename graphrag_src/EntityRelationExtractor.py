@@ -3,7 +3,7 @@ import logging
 import os
 
 from datasets import IterableDataset, load_dataset, load_from_disk, Dataset, DatasetDict
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, cast
 from gliner import GLiNER
 from gliner.model import BaseGLiNER
 from FlagEmbedding import BGEM3FlagModel
@@ -458,22 +458,26 @@ class EntityRelationExtractor:
                     self.logger.info("Flushing %d relation rows to %s", len(relation_rows), self.RELATIONS_PATH)
                     relation_rows.clear()
 
-            for batch in tqdm(chunks.iter(batch_size=batch_size), total=self._n_chunks/batch_size, desc="Extracting"):
-                records = [dict(zip(batch.keys(), vals)) for vals in zip(*batch.values())]
-                for result in self._process_batch(records):
-                    cid = result["chunk_id"]
-                    entity_rows.extend(
-                        {"chunk_id": cid, "text": e["text"], "label": e["label"]}
-                        for e in result["entities"]
-                    )
-                    relation_rows.extend(
-                        {"chunk_id": cid, "head": r["head"],
-                        "head_type": r.get("head_type") or r.get("head_label", ""), "relation": r["relation"],
-                        "tail": r["tail"], "tail_type": r.get("tail_type") or r.get("tail_label", "")}
-                        for r in result["relations"]
-                    )
-                if len(entity_rows) >= FLUSH_AT or len(relation_rows) >= FLUSH_AT:
-                    flush()
+            total_batches = (self._n_chunks + batch_size - 1) // batch_size
+            with tqdm(total=total_batches, desc="Extracting") as pbar:
+                for batch in chunks.iter(batch_size=batch_size):
+                    batch_dict = cast(Dict[str, List[Any]], batch)
+                    records = [dict(zip(batch_dict.keys(), vals)) for vals in zip(*batch_dict.values())]
+                    for result in self._process_batch(records):
+                        cid = result["chunk_id"]
+                        entity_rows.extend(
+                            {"chunk_id": cid, "text": e["text"], "label": e["label"]}
+                            for e in result["entities"]
+                        )
+                        relation_rows.extend(
+                            {"chunk_id": cid, "head": r["head"],
+                            "head_type": r.get("head_type") or r.get("head_label", ""), "relation": r["relation"],
+                            "tail": r["tail"], "tail_type": r.get("tail_type") or r.get("tail_label", "")}
+                            for r in result["relations"]
+                        )
+                    pbar.update(1)
+                    if len(entity_rows) >= FLUSH_AT or len(relation_rows) >= FLUSH_AT:
+                        flush()
 
             flush()
 
