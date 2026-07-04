@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
 import igraph as ig
@@ -10,15 +11,19 @@ import polars as pl
 import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
-from datasets import Dataset, load_from_disk
+from datasets import Dataset, load_dataset, load_from_disk
 import requests
 from tqdm import tqdm
 import os
 
+
+
 try:
     from .EntityRelationExtractor import EntityRelationExtractor
+    from  . import DescriptionGenerator as dg
 except ImportError:
     from EntityRelationExtractor import EntityRelationExtractor
+    from . import DescriptionGenerator as dg
 
 
 class GraphGenerator:
@@ -34,12 +39,17 @@ class GraphGenerator:
         ner_model_name=None,
         embed_model_name=None,
         description_model_name=None,
+        dataset_path="wiki_dpr",
         #TODO implement different models
         
         ) -> None:
         self.extractor=EntityRelationExtractor(chunks_path=self.CHUNKS_PATH)
-        self.desc_model=description_model_name
+        self.desc_model=description_model_name or "llama3.1:8b-instruct-q4_K_M"
         self.logger = logging.getLogger(__name__)
+        if dataset_path=="wiki_dpr":
+            ds = load_dataset("facebook/wiki_dpr", name="psgs_w100.nq.no_index.no_embeddings", split="train")
+            self.CHUNKS_PATH=str(Path(ds.cache_files[0]["filename"]).parent)
+
 
     @staticmethod
     def _format_rss_mb() -> float:
@@ -197,26 +207,30 @@ class GraphGenerator:
                 )
             os.makedirs(communities_path, exist_ok=True)
             relations_for_community.sink_parquet(f"{communities_path}_community_{cluster_id}_relations.parquet")
+        self.logger.info("Graph generation completed successfully.")
+            
 
-    def get_context_size(self, model: str, host: str = "http://localhost:11434") -> int:
-        pass
-    
-    def _generate_community_descriptions(
-        self,
-        entity_db_path: str,
-        max_concurrent: int = 8,
-        chunk_batch_size: int = 256,
-        flush_every: int = 500,) -> None:
+    async def generate_graph(self) -> None:
         
-        model = self.desc_model or "llama3.1:8b-instruct-q4_K_M"
-        context_size=self.get_context_size(model)
-        n_communities = json.load(open(self.ENTITIES_PATH + "_nclusters.json"))
+        # Generate entities and relations from the dataset
+        extractor = self.extractor
+        extractor.generate()
+        entity_path=extractor.ENTITIES_PATH
+        relation_path=extractor.RELATIONS_PATH
+        del extractor
         
-        client = ollama.AsyncClient()
-        semaphore = asyncio.Semaphore(max_concurrent)
+        #Generate entity descriptionjs
+        generator = dg.EntityDescriptionGenerator(self.CHUNKS_PATH, entity_path, self.ENTITIES_PATH, self.logger, model=self.desc_model)
+        await generator.generate_descriptions()
         
-        entity_df = pl.scan_parquet(entity_db_path) \
-            .select(
-                ["id", "canonical_name", "label", "cluster_id", "source_chunks"]
-            )
+        # Generate the graph from the entities and relations
+        graph = self._generate_graph(self.ENTITIES_PATH, relation_path)
+        self._compute_clusters(graph)
+        
+        # Create helper relation table for each community
+        self._relations_for_community(self.ENTITIES_PATH, relation_path, self.COMMUNITIES_PATH)
+        
+        #Generate community descriptions
+        community_generator = dg.CommunityDescriptionGenerator(self.COMMUNITIES_PATH, self.ENTITIES_PATH, self.logger, model=self.desc_model)
+        await community_generator.generate_descriptions()
         
