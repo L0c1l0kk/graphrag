@@ -149,6 +149,7 @@ class EntityRelationExtractor:
         self.logger.info("Loading chunks from %s", self.chunks_path)
         if self.chunks_path=="wiki_dpr":
             ds = load_dataset("facebook/wiki_dpr", name="psgs_w100.nq.no_index.no_embeddings", split="train")
+            ds=ds.train_test_split(test_size=0.25, seed=42)["test"]
             self._n_chunks=len(ds)
         else:
             ds = load_from_disk(self.chunks_path)
@@ -380,7 +381,7 @@ class EntityRelationExtractor:
         return lazy_df
     
     # generation logic
-    def generate(self, dataset_path: str = "wiki_dpr", batch_size: int = 400):
+    def generate(self, dataset_path: str = "wiki_dpr", batch_size: int = 256):
         """
         Run extraction over a dataset and produce deduplicated entity and relation databases.
 
