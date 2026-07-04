@@ -30,7 +30,7 @@ class DescriptionGenerator(ABC):
         # Queue items are fully self-contained records (id + whatever fields
         # _describe needs), not just (id, excerpts) — this lets _scan stream
         # everything a subclass needs without any global in-memory DB lookup.
-        self.ready: asyncio.Queue[dict | None] = asyncio.Queue()
+        self.ready: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=6000)
         self.model = model or "llama3.1:8b-instruct-q4_K_M"
         # Row count for the progress bar, set cheaply from Parquet metadata
         # (footer only — doesn't require reading/loading the actual rows).
@@ -350,11 +350,11 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                         "source_chunks": e["source_chunks"],
                         "excerpts": excerpts,
                     }
-                    loop.call_soon_threadsafe(self.ready.put_nowait, record)
+                    asyncio.run_coroutine_threadsafe(self.ready.put(record), loop).result()
         finally:
             con.close()
 
-        loop.call_soon_threadsafe(self.ready.put_nowait, None)
+        asyncio.run_coroutine_threadsafe(self.ready.put(record), loop).result()
 
     async def generate_descriptions(self) -> str:
         # Row count from the Parquet footer only — no data actually read yet.
