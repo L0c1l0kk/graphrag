@@ -34,6 +34,7 @@ dependencies:
     - scikit-learn>=1.5.0    # cosine similarity for deduplication
     - polars
     - psutil
+    - duckdb
 
     # Serialization / checkpointing
     - orjson>=3.10.0         # fast JSON; used for checkpoint files

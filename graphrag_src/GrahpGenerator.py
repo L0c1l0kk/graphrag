@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from typing import Any, Dict, List, Optional, cast
 
@@ -10,6 +11,7 @@ import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import Dataset, load_from_disk
+import requests
 from tqdm import tqdm
 import os
 
@@ -25,12 +27,6 @@ class GraphGenerator:
     RELATIONS_PATH="data/relations"
     
     CHUNKS_PATH="data/chunks_arrow"
-    _ENTITY_SCHEMA = pa.schema([
-            pa.field("id",             pa.string()),
-            pa.field("canonical_name", pa.string()),
-            pa.field("label",          pa.string()),
-            pa.field("description",    pa.string()),
-        ]) # this changes after clustering
     
     def __init__(
         self,
@@ -49,140 +45,6 @@ class GraphGenerator:
         return psutil.Process().memory_info().rss / (1024 * 1024)
     
     
-    # TODO Move this to EntityRelationExtractor, it makes more sense there
-    async def _generate_entity_descriptions(
-        self,
-        output_path: str,
-        entity_db: Dict[str, Dict] | None = None,
-        entity_db_path: str | None = None,
-        max_concurrent: int = 8,
-        chunk_batch_size: int = 256,
-        flush_every: int = 500,
-    ) -> str:
-        """
-        Returns output_path — entity descriptions are streamed to parquet,
-        never fully materialized in RAM.
-        """
-
-        if entity_db is None:
-            if entity_db_path is None:
-                raise ValueError("Either entity_db or entity_db_path must be provided")
-            entity_db = pq.read_table(entity_db_path).to_pydict()
-        assert entity_db is not None
-
-        model = self.desc_model or "llama3.1:8b-instruct-q4_K_M"
-
-        PROMPT = (
-            'You are an information extraction assistant. Based on the following text excerpts, '
-            'write a concise 2-3 sentence description of the entity "{entity_name}" (type: {entity_type}).\n'
-            'Focus only on factual information directly supported by the excerpts. '
-            'Be specific and avoid generic statements.\n\n'
-            'Excerpts:\n{excerpts}\n\n'
-            'Description of "{entity_name}":'
-        )
-
-        client = ollama.AsyncClient()
-        semaphore = asyncio.Semaphore(max_concurrent)
-        ready: asyncio.Queue[tuple[str, list[str]] | None] = asyncio.Queue()
-
-        # ── Shared write buffer — only the event loop thread touches this ──────
-        write_lock = asyncio.Lock()
-        buffer: list[dict] = []
-        writer: pq.ParquetWriter | None = None
-
-        async def _flush(force: bool = False) -> None:
-            nonlocal writer, buffer
-            if not buffer:
-                return
-            async with write_lock:
-                if not force and len(buffer) < flush_every:
-                    return
-                batch = buffer
-                buffer = []
-            table = pa.table({
-                "id":             [r["id"]             for r in batch],
-                "canonical_name": [r["canonical_name"] for r in batch],
-                "label":          [r["label"]          for r in batch],
-                "description":    [r["description"]    for r in batch],
-            }, schema=self._ENTITY_SCHEMA)
-            if writer is None:
-                writer = pq.ParquetWriter(output_path, self._ENTITY_SCHEMA, compression="zstd")
-            writer.write_table(table)
-
-        # ── Producer ──────────────────────────────────────────────────────────
-        async def _collect() -> None:
-            loop = asyncio.get_running_loop()
-
-            def _scan() -> None:
-                context_chunks: dict[str, list[str]] = {eid: [] for eid in entity_db}
-                needs_more: set[str] = set(entity_db)
-                for batch in self.extractor.load_chunks().iter(chunk_batch_size):
-                    if not needs_more:
-                        break
-                    batch_dict = cast(dict[str, list[Any]], batch)
-                    records = [dict(zip(batch_dict.keys(), values)) for values in zip(*batch_dict.values())]
-                    for record in records:
-                        eid = record["id"]
-                        if eid in needs_more:
-                            bucket = context_chunks[eid]
-                            bucket.append(record["text"])
-                            if len(bucket) >= 3:
-                                needs_more.discard(eid)
-                                loop.call_soon_threadsafe(ready.put_nowait, (eid, list(bucket)))
-                for eid in needs_more:
-                    loop.call_soon_threadsafe(ready.put_nowait, (eid, list(context_chunks[eid])))
-                loop.call_soon_threadsafe(ready.put_nowait, None)
-
-            await asyncio.to_thread(_scan)
-
-        # ── Consumer ──────────────────────────────────────────────────────────
-        async def _describe(eid: str, excerpts: list[str], pbar: tqdm) -> None:
-            nonlocal buffer
-            entity = entity_db[eid]
-            if not excerpts:
-                description = f"A {entity['label']} named {entity['canonical_name']}."
-            else:
-                prompt = PROMPT.format(
-                    entity_name=entity["canonical_name"],
-                    entity_type=entity["label"],
-                    excerpts="\n---\n".join(excerpts),
-                )
-                async with semaphore:
-                    response = await client.generate(
-                        model=model,
-                        prompt=prompt,
-                        options={"temperature": 0.1, "num_predict": 150},
-                    )
-                description = response["response"].strip()
-
-            # Buffer the result — no mutation of entity_db at all
-            async with write_lock:
-                buffer.append({
-                    "id":             eid,
-                    "canonical_name": entity["canonical_name"],
-                    "label":          entity["label"],
-                    "description":    description,
-                })
-            await _flush()
-            pbar.update(1)
-
-        async def _consume(pbar: tqdm) -> None:
-            tasks = []
-            while True:
-                item = await ready.get()
-                if item is None:
-                    break
-                eid, excerpts = item
-                tasks.append(asyncio.create_task(_describe(eid, excerpts, pbar)))
-            await asyncio.gather(*tasks)
-            await _flush(force=True)  # drain the last partial batch
-            if writer:
-                writer.close()
-
-        with tqdm(total=len(entity_db), desc="Generating descriptions") as pbar:
-            await asyncio.gather(_collect(), _consume(pbar))
-
-        return output_path
     
     def _load_parquet_frame(self, path: str, columns: List[str]) -> pl.DataFrame:
         schema = set(pl.read_parquet_schema(path).keys())
@@ -190,6 +52,18 @@ class GraphGenerator:
         if missing_columns:
             raise KeyError(f"{path} is missing required columns: {missing_columns}")
         return pl.read_parquet(path, columns=columns)
+
+    def _save_inplace(self, df: pl.DataFrame, path: str) -> None:
+        """Save a Polars DataFrame to a Parquet file, overwriting the original."""
+        temp_path = f"{path}.tmp"
+        try:
+            df.write_parquet(temp_path, compression="zstd")
+            os.replace(temp_path, path)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
+    
 
     def _generate_graph(self, entity_db_path: str, relation_db_path: str) -> ig.Graph:
         self.logger.info(
@@ -222,7 +96,9 @@ class GraphGenerator:
             edge_frame.width,
             self._format_rss_mb(),
         )
-
+        #save grouped relations with weights
+        self._save_inplace(edge_frame, relation_db_path)
+        
         self.logger.info("Converting frames to pandas for igraph: rss=%.1f MB", self._format_rss_mb())
         vertex_pdf = vertex_frame.rename({"id": "name"}).to_pandas()
         edge_pdf = edge_frame.to_pandas()
@@ -260,13 +136,6 @@ class GraphGenerator:
         The file is rewritten atomically by writing to a temporary parquet file
         first and then replacing the original on success.
         """
-        self.logger.info(
-            "Saving new column '%s' to %s via join on '%s': rss=%.1f MB",
-            new_column_name,
-            path,
-            left_on,
-            self._format_rss_mb(),
-        )
         lazy_df = pl.scan_parquet(path).join(
             join_df.lazy().select([right_on, value_col]).rename({value_col: new_column_name}),
             left_on=left_on,
@@ -281,12 +150,12 @@ class GraphGenerator:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             raise e
-        
+    
     def _compute_clusters(self, graph: ig.Graph) -> None:
         self.logger.info("Computing clusters: rss=%.1f MB", self._format_rss_mb())
         
         clustering = graph.community_leiden(
-            objective_function="modularity",
+            objective_function="modularity", # switch to CPM
             n_iterations=2,
             weights=graph.es["weight"] if "weight" in graph.es.attributes() else None,
         )
@@ -296,6 +165,12 @@ class GraphGenerator:
             "cluster_id": clustering.membership,
         })
         
+        n_communities = len(clustering)
+        assert set(clustering.membership) == set(range(n_communities)), "unexpected non-contiguous cluster ids"
+        
+        with open(self.ENTITIES_PATH + "_nclusters.json", "w") as f:
+            json.dump(n_communities, f)
+
         self._save_joined_column(
             self,
             path=self.ENTITIES_PATH,
@@ -305,6 +180,40 @@ class GraphGenerator:
             value_col="cluster_id",
             new_column_name="cluster_id",
         )
+        self.logger.info("Clusters computed and saved in %s", self.ENTITIES_PATH)
         
-    def _generate_community_descriptions(self, entity_db_path: str) -> None:
+    def _relations_for_community(self, entity_path: str, relation_path: str, cluster_id: int) -> pl.DataFrame:
+        members = (
+            pl.scan_parquet(entity_path)
+            .filter(pl.col("cluster_id") == cluster_id)
+            .select("id")
+        )
+        return (
+            pl.scan_parquet(relation_path)
+            .join(members.rename({"id": "head"}), on="head", how="inner")
+            .join(members.rename({"id": "tail"}), on="tail", how="inner")
+            .collect()
+        )
+    
+    def get_context_size(self, model: str, host: str = "http://localhost:11434") -> int:
         pass
+    
+    def _generate_community_descriptions(
+        self,
+        entity_db_path: str,
+        max_concurrent: int = 8,
+        chunk_batch_size: int = 256,
+        flush_every: int = 500,) -> None:
+        
+        model = self.desc_model or "llama3.1:8b-instruct-q4_K_M"
+        context_size=self.get_context_size(model)
+        n_communities = json.load(open(self.ENTITIES_PATH + "_nclusters.json"))
+        
+        client = ollama.AsyncClient()
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        entity_df = pl.scan_parquet(entity_db_path) \
+            .select(
+                ["id", "canonical_name", "label", "cluster_id", "source_chunks"]
+            )
+        
