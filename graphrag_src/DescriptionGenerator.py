@@ -124,10 +124,18 @@ class EntityDescriptionGenerator(DescriptionGenerator):
     _MAX_CANDIDATES_FOR_MMR = 200         # cap MMR's O(k*n) cost for hub entities
     _HARD_CAP_BEFORE_CLUSTERING = 5000    # safety valve before even clustering
 
-    def __init__(self, *args, chunk_index_path: str | None = None, entity_batch_size: int = 2000, **kwargs):
+    def __init__(self, *args, chunk_index_path: str | None = None, entity_batch_size: int = 2000,
+                 input_format: str | None = None, chunk_id_column: str = "chunk_id",
+                 text_column: str = "text", **kwargs):
         super().__init__(*args, **kwargs)
         self.chunk_index_path = chunk_index_path or f"{self.input_path}.chunks.duckdb"
         self.entity_batch_size = entity_batch_size
+        # "parquet" (default, unchanged behavior) or "arrow" — a single
+        # memory-mapped .arrow file or a directory of HF-datasets-style
+        # .arrow shards (e.g. wiki_dpr). Pass explicitly to skip sniffing.
+        self.input_format = input_format or self._detect_input_format(self.input_path)
+        self.chunk_id_column = chunk_id_column
+        self.text_column = text_column
 
     async def _describe(self, record: dict, pbar: tqdm) -> None:
         excerpts = record["excerpts"]
@@ -273,12 +281,56 @@ class EntityDescriptionGenerator(DescriptionGenerator):
     # chunk_db as an indexed store (one-time build) + batched entity_db scan
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _detect_input_format(input_path: str) -> str:
+        """Best-effort sniff of whether input_path is a Parquet source or an
+        Arrow source (a single memory-mapped .arrow file, or a directory of
+        .arrow shards — the on-disk layout HF `datasets` uses for things
+        like wiki_dpr). Pass input_format="parquet"/"arrow" explicitly to
+        skip this and avoid any guessing."""
+        p = Path(input_path)
+        if p.is_dir():
+            return "arrow" if any(p.glob("*.arrow")) else "parquet"
+        return "arrow" if p.suffix == ".arrow" else "parquet"
+
+    @staticmethod
+    def _read_arrow_file(path: Path) -> pa.Table:
+        """Zero-copy read of a single memory-mapped .arrow file. Tries the
+        random-access IPC File format first (has a footer), falling back to
+        the sequential IPC Stream format — different `datasets` versions
+        have written either, and this way we don't need to know which."""
+        mm = pa.memory_map(str(path), "r")
+        try:
+            return pa.ipc.open_file(mm).read_all()
+        except pa.ArrowInvalid:
+            mm.seek(0)
+            return pa.ipc.open_stream(mm).read_all()
+
+    @classmethod
+    def _load_arrow_source(cls, input_path: str) -> pa.Table:
+        """Load a single .arrow file or a directory of shards (e.g. a
+        wiki_dpr cache dir) into one Table. Shards are memory-mapped and
+        concatenated without copying the underlying buffers."""
+        p = Path(input_path)
+        files = sorted(p.glob("*.arrow")) if p.is_dir() else [p]
+        if not files:
+            raise FileNotFoundError(f"No .arrow files found under {input_path}")
+        tables = [cls._read_arrow_file(f) for f in files]
+        return tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+
     def _ensure_chunk_index(self) -> str:
         """One-time cost: materialize chunk_db into a persistent, indexed
         DuckDB table so later batched lookups are index probes against a
         ~21M-row table, not a full join+sort of it. Reused across runs.
 
-        Assumes chunk_db (self.input_path) has columns: chunk_id, text.
+        Assumes chunk_db (self.input_path) has a chunk-id column and a text
+        column (named "chunk_id"/"text" by default — override via
+        chunk_id_column/text_column, e.g. for wiki_dpr's "id"/"text").
+        Source can be Parquet (self.input_format == "parquet", the original
+        behavior) or Arrow (self.input_format == "arrow"; a single .arrow
+        file or a directory of shards, memory-mapped and registered with
+        DuckDB directly — no conversion to Parquet needed).
+
         (No embedding column needed — evidence selection runs on TF-IDF
         vectors fit locally per entity, not on precomputed chunk embeddings.)
         """
@@ -286,11 +338,24 @@ class EntityDescriptionGenerator(DescriptionGenerator):
             con = duckdb.connect(self.chunk_index_path)
             try:
                 con.execute("PRAGMA memory_limit='6GB'")
-                con.execute(
-                    "CREATE TABLE chunks AS "
-                    "SELECT chunk_id, text FROM read_parquet(?)",
-                    [self.input_path],
-                )
+                if self.input_format == "arrow":
+                    table = self._load_arrow_source(self.input_path)
+                    con.register("chunks_src", table)
+                    try:
+                        con.execute(
+                            f'CREATE TABLE chunks AS SELECT '
+                            f'CAST("{self.chunk_id_column}" AS VARCHAR) AS chunk_id, '
+                            f'CAST("{self.text_column}" AS VARCHAR) AS text '
+                            f'FROM chunks_src'
+                        )
+                    finally:
+                        con.unregister("chunks_src")
+                else:
+                    con.execute(
+                        "CREATE TABLE chunks AS "
+                        "SELECT chunk_id, text FROM read_parquet(?)",
+                        [self.input_path],
+                    )
                 con.execute("CREATE UNIQUE INDEX chunks_pk ON chunks(chunk_id)")
             finally:
                 con.close()
