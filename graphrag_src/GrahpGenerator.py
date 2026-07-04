@@ -25,6 +25,7 @@ class GraphGenerator:
     
     ENTITIES_PATH="data/entities_with_descriptions"
     RELATIONS_PATH="data/relations"
+    COMMUNITIES_PATH="data/communities/"
     
     CHUNKS_PATH="data/chunks_arrow"
     
@@ -168,7 +169,7 @@ class GraphGenerator:
         n_communities = len(clustering)
         assert set(clustering.membership) == set(range(n_communities)), "unexpected non-contiguous cluster ids"
         
-        with open(self.ENTITIES_PATH + "_nclusters.json", "w") as f:
+        with open(self.COMMUNITIES_PATH + "_nclusters.json", "w") as f:
             json.dump(n_communities, f)
 
         self._save_joined_column(
@@ -182,19 +183,21 @@ class GraphGenerator:
         )
         self.logger.info("Clusters computed and saved in %s", self.ENTITIES_PATH)
         
-    def _relations_for_community(self, entity_path: str, relation_path: str, cluster_id: int) -> pl.DataFrame:
-        members = (
-            pl.scan_parquet(entity_path)
-            .filter(pl.col("cluster_id") == cluster_id)
-            .select("id")
-        )
-        return (
-            pl.scan_parquet(relation_path)
-            .join(members.rename({"id": "head"}), on="head", how="inner")
-            .join(members.rename({"id": "tail"}), on="tail", how="inner")
-            .collect()
-        )
-    
+    def _relations_for_community(self, entity_path: str, relation_path: str, communities_path: str):
+        for cluster_id in pl.scan_parquet(entity_path).select("cluster_id").unique().collect().to_series():
+            members = (
+                pl.scan_parquet(entity_path)
+                .filter(pl.col("cluster_id") == cluster_id)
+                .select("id")
+            )
+            relations_for_community = (
+                pl.scan_parquet(relation_path)
+                .join(members.rename({"id": "head"}), on="head", how="inner")
+                .join(members.rename({"id": "tail"}), on="tail", how="inner")
+                )
+            os.makedirs(communities_path, exist_ok=True)
+            relations_for_community.sink_parquet(f"{communities_path}_community_{cluster_id}_relations.parquet")
+
     def get_context_size(self, model: str, host: str = "http://localhost:11434") -> int:
         pass
     

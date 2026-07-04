@@ -1,7 +1,10 @@
 import asyncio
+import json
 import logging
 import os
+from pathlib import Path
 import random
+import re
 from abc import ABC, abstractmethod
 
 import duckdb
@@ -12,10 +15,11 @@ import pyarrow.parquet as pq
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
+import polars as pl
 
 
 class DescriptionGenerator(ABC):
-    def __init__(self, input_path, entity_db_path, output_path, logger: logging.Logger, flush_every: int = 1000, max_concurrent: int = 8, model: str | None = None):
+    def __init__(self, input_path, entity_db_path, output_path, logger: logging.Logger, flush_every: int = 1000, max_concurrent: int = 32, model: str | None = None):
         self.logger = logger
         self.flush_every = flush_every
         self.output_path = output_path
@@ -66,15 +70,18 @@ class DescriptionGenerator(ABC):
     async def _describe(self, record: dict, pbar: tqdm) -> None:
         pass
 
-    async def _consume(self, pbar: tqdm) -> None:
-        tasks = []
+    async def _worker(self, pbar: tqdm) -> None:
         while True:
             item = await self.ready.get()
             if item is None:
+                await self.ready.put(None)  # re-broadcast so sibling workers also exit
                 break
-            tasks.append(asyncio.create_task(self._describe(item, pbar)))
-        await asyncio.gather(*tasks)
-        await self._flush(force=True)  # drain the last partial batch
+            await self._describe(item, pbar)
+
+    async def _consume(self, pbar: tqdm) -> None:
+        workers = [asyncio.create_task(self._worker(pbar)) for _ in range(self.max_concurrent)]
+        await asyncio.gather(*workers)
+        await self._flush(force=True)
         if self.writer:
             self.writer.close()
 
@@ -85,6 +92,13 @@ class DescriptionGenerator(ABC):
             await asyncio.gather(self._collect(), self._consume(pbar))
 
         return self.output_path
+    
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        # Cheap ~4-chars/token approximation — a safe overestimate for most
+        # tokenizers on English text. Swap for a real tokenizer if you need
+        # this to be exact rather than a conservative upper bound.
+        return max(1, len(text) // 4)
 
 
 class EntityDescriptionGenerator(DescriptionGenerator):
@@ -112,13 +126,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
 
     def __init__(self, *args, chunk_index_path: str | None = None, entity_batch_size: int = 2000, **kwargs):
         super().__init__(*args, **kwargs)
-        # Persistent, indexed DuckDB table built once from chunk_db (self.input_path).
-        # Reused across runs — delete this file if chunk_db is regenerated.
         self.chunk_index_path = chunk_index_path or f"{self.input_path}.chunks.duckdb"
-        # How many entities' worth of source_chunks we resolve per lookup batch.
-        # This is the read-side analogue of flush_every: it bounds how much
-        # chunk text/embedding data is resident in memory at once, independent
-        # of how large entity_db or chunk_db are in total.
         self.entity_batch_size = entity_batch_size
 
     async def _describe(self, record: dict, pbar: tqdm) -> None:
@@ -161,13 +169,6 @@ class EntityDescriptionGenerator(DescriptionGenerator):
     # excerpts (at most a few hundred short texts after downsampling), so this
     # is cheap, local, and needs no embedding model or GPU at all.
     # -------------------------------------------------------------------------
-
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        # Cheap ~4-chars/token approximation — a safe overestimate for most
-        # tokenizers on English text. Swap for a real tokenizer if you need
-        # this to be exact rather than a conservative upper bound.
-        return max(1, len(text) // 4)
 
     @staticmethod
     def _tfidf(texts: list[str]):
@@ -312,7 +313,6 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         chunk_db = self._ensure_chunk_index()
         con = duckdb.connect(chunk_db, read_only=True)
         con.execute("PRAGMA memory_limit='6GB'")
-        con.execute("PRAGMA threads=4")
 
         try:
             pf = pq.ParquetFile(self.entity_db_path)
@@ -354,9 +354,176 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         finally:
             con.close()
 
-        asyncio.run_coroutine_threadsafe(self.ready.put(record), loop).result()
+        asyncio.run_coroutine_threadsafe(self.ready.put(None), loop).result()
 
     async def generate_descriptions(self) -> str:
         # Row count from the Parquet footer only — no data actually read yet.
         self._total = pq.ParquetFile(self.entity_db_path).metadata.num_rows
+        return await super().generate_descriptions()
+
+
+
+class CommunityDescriptionGenerator(DescriptionGenerator):
+    _SCHEMA = pa.schema([
+            pa.field("cluster_id",      pa.string()),
+            pa.field("entities",        pa.list_(pa.string())),
+            pa.field("description",     pa.string()),
+        ])
+    _PROMPT = (
+            'You are an information extraction assistant. Based on the following entities and entity descriptions, and relationships between them, '
+            'write a description of the entity cluster "{cluster_id}".\n'
+            'Focus only on factual information directly supported by the excerpts. '
+            'Be specific and avoid generic statements.\n\n'
+            'Relationships with entity descriptions:\n{relationships}\n\n'
+            'Description of "{cluster_id}":'
+        )
+    
+    def __init__(self, *args, entity_index_path: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.entity_index_path = entity_index_path or f"{self.input_path}.entities.duckdb"
+        self.ready: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=6000)
+        self._community_ids: list[int] | None = None
+    
+    async def _describe(self, record: dict, pbar: tqdm) -> None:
+        prompt = self._PROMPT.format(
+            cluster_id=record["cluster_id"],
+            relationships="\n---\n".join(
+                f"{r['head_desc']} ({r['head']}) --[{', '.join(r['relations'])}]--> {r['tail']} ({r['tail_desc']})"
+                for r in record["relationships"]
+            ),
+            )
+        async with self.semaphore:
+            response = await self.client.generate(
+                model=self.model,
+                prompt=prompt,
+                options={"temperature": 0.1, "num_predict": 150},
+            )
+        description = response["response"].strip()
+
+        async with self.write_lock:
+            self.buffer.append({
+                "cluster_id":     record["cluster_id"],
+                "entities":       record["entities"],
+                "description":    description,
+            })
+        await self._flush()
+        pbar.update(1)
+        
+        
+    def _ensure_entity_index(self) -> str:
+        """One-time cost: materialize entity_db into a persistent, indexed
+        DuckDB table so later batched lookups are index probes.
+
+        Assumes entity_db (entity_path) has columns: id, canonical_name, label, description.
+        """
+        if not os.path.exists(self.entity_index_path):
+            con = duckdb.connect(self.entity_index_path)
+            try:
+                con.execute("PRAGMA memory_limit='6GB'")
+                con.execute(
+                    "CREATE TABLE entities AS "
+                    "SELECT id, canonical_name, label, description FROM read_parquet(?)",
+                    [self.entity_db_path],
+                )
+                con.execute("CREATE UNIQUE INDEX entities_pk ON entities(id)")
+            finally:
+                con.close()
+        return self.entity_index_path
+    
+    def _get_top_k_by_degree(self, cluster_id: str, input_path: str, k: int) -> pl.DataFrame:
+        """Compute top k relationships by degree (in + out) weighted by edge weights for a given community."""
+        in_degree_df = pl.scan_parquet(input_path+f"_community_{cluster_id}_relations.parquet") \
+            .group_by("tail") \
+            .agg((pl.col("weight").sum()/pl.count("head")).alias("in_degree")) \
+            .rename({"tail": "id"})
+        
+        degree_df = pl.scan_parquet(input_path+f"_community_{cluster_id}_relations.parquet") \
+            .group_by("head") \
+            .agg((pl.col("weight").sum()/pl.count("tail")).alias("out_degree")) \
+            .rename({"head": "id"}) \
+            .join(in_degree_df, on="id", how="full", coalesce=True) \
+            .fill_null(0) \
+            .with_columns((pl.col("in_degree") + pl.col("out_degree")).alias("degree")) \
+        
+        df = pl.scan_parquet(input_path+f"_community_{cluster_id}_relations.parquet") \
+            .join(degree_df.select("id", "degree"), left_on="head", right_on="id", how="inner") \
+            .join(degree_df.select("id", "degree"), left_on="tail", right_on="id", how="inner", suffix="_tail") \
+            .with_columns((pl.col("degree") + pl.col("degree_tail")).alias("total_degree")) \
+            .top_k(k, by="total_degree") \
+            .select(["head", "relations", "tail"]) \
+            .collect()
+        
+        return df
+    
+    def _discover_community_ids(self) -> list[int]:
+        """Find cluster ids from the community relation Parquet files on disk.
+
+        Path.glob() only supports shell-glob syntax, not regex, and
+        self.input_path is a file-prefix rather than a directory — so this
+        globs the actual filename pattern in the parent directory and pulls
+        the ids out with a real regex.
+        """
+        base = Path(self.input_path)
+        name_pattern = re.compile(rf"^{re.escape(base.name)}_community_(\d+)_relations\.parquet$")
+        ids = []
+        for f in base.parent.glob(f"{base.name}_community_*_relations.parquet"):
+            m = name_pattern.match(f.name)
+            if m:
+                ids.append(int(m.group(1)))
+        return sorted(ids)
+
+    def _scan(self, loop: asyncio.AbstractEventLoop) -> None:
+        
+        self._ensure_entity_index()
+        con=duckdb.connect(self.entity_index_path, read_only=True)
+        con.execute("PRAGMA memory_limit='6GB'")
+        
+        community_ids = self._community_ids if self._community_ids is not None else self._discover_community_ids()
+        
+        for cluster_id in community_ids:
+            top_k_relations = self._get_top_k_by_degree(str(cluster_id), self.input_path, k=10)
+            wanted=sorted(set(top_k_relations.select("head").to_series().to_list() + top_k_relations.select("tail").to_series().to_list()))
+            entity_lookup: dict[str, dict[str, str]] = {}
+            if wanted:
+                con.register("wanted_ids", pa.table({"id": wanted}))
+                try:
+                    rows = con.execute(
+                        "SELECT id, canonical_name, label, description FROM entities JOIN wanted_ids USING (id)"
+                    ).fetchall()
+                    entity_lookup = {
+                        id_: {"canonical_name": canonical_name, "label": label, "description": description}
+                        for (id_, canonical_name, label, description) in rows
+                    }
+                finally:
+                    con.unregister("wanted_ids")
+
+            relationships: list[dict[str, str]] = []
+            for row in top_k_relations.iter_rows(named=True):
+                head_info = entity_lookup.get(row["head"])
+                tail_info = entity_lookup.get(row["tail"])
+                if head_info is None or tail_info is None:
+                    continue  # entity description not available yet; skip this edge
+                relationships.append({
+                    "head": head_info["canonical_name"],
+                    "head_desc": head_info["description"],
+                    "relations": row["relations"],
+                    "tail": tail_info["canonical_name"],
+                    "tail_desc": tail_info["description"],
+                })
+
+            record = {
+                "cluster_id": str(cluster_id),
+                "entities": wanted,
+                "relationships": relationships,
+            }
+            asyncio.run_coroutine_threadsafe(self.ready.put(record), loop).result()
+        
+        con.close()
+        asyncio.run_coroutine_threadsafe(self.ready.put(None), loop).result()
+
+    async def generate_descriptions(self) -> str:
+        # Discover communities once up front so both the progress-bar total
+        # and the _scan loop use the same list (also avoids re-globbing).
+        self._community_ids = self._discover_community_ids()
+        self._total = len(self._community_ids)
         return await super().generate_descriptions()
