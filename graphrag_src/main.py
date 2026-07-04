@@ -1,4 +1,6 @@
-from EntityRelationExtractor import EntityRelationExtractor
+import asyncio
 
-extractor = EntityRelationExtractor()
-extractor.generate()
+from GraphGenerator import GraphGenerator
+
+generator = GraphGenerator()
+asyncio.run(generator.generate_graph())

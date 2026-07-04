@@ -1,7 +1,7 @@
 import pytest
 import polars as pl
 
-from graphrag_src.GrahpGenerator import GraphGenerator
+from graphrag_src.GraphGenerator import GraphGenerator
 
 
 def test_generate_graph_builds_vertices_and_aggregates_edges(tmp_path):
