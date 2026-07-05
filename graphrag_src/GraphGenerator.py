@@ -10,6 +10,7 @@ from FlagEmbedding import BGEM3FlagModel
 import psutil
 from datasets import load_dataset
 import os
+from tqdm import tqdm
 
 
 
@@ -219,49 +220,54 @@ class GraphGenerator:
         client = chromadb.PersistentClient(self.CHROMA_PATH)
         collection = client.get_or_create_collection(name="entity_embeddings", metadata={"hnsw:space": "cosine"},)
         model=BGEM3FlagModel(self.embed_model, use_fp16=True)
-        
-        
-        total_embedded = 0
-        for batch in self._iter_parquet_batches(path, columns=["id", "canonical_name", "description", "cluster_id"], batch_size=256):
-            ids = batch["id"]
-            names = batch["canonical_name"]
-            descriptions = batch["description"]
-            cluster_ids = batch["cluster_id"]
 
-            texts = [
-                f"{name}: {description}" if description else name
-                for name, description in zip(names, descriptions)
-            ]
-            
-            valid_idx = [i for i, text in enumerate(texts) if text]
-            if not valid_idx:
-                continue
-            
-            valid_ids = [ids[i] for i in valid_idx]
-            valid_texts = [texts[i] for i in valid_idx]
-            valid_metadata = [{"cluster_id": cluster_ids[i] if cluster_ids[i] is not None else -1} for i in valid_idx]
-            
-            embeddings = model.encode(valid_texts,
-                batch_size=len(valid_texts),
-                max_length=128,
-                return_dense=True,
-                return_sparse=False,
-                return_colbert_vecs=False,
-                )["dense_vecs"].tolist()
-            
-            collection.upsert(
-                ids=valid_ids,
-                embeddings=embeddings,
-                metadatas=valid_metadata,
-                documents=valid_texts,
-            )
-            total_embedded += len(valid_ids)
-            self.logger.info(
-                "Embedded entity batch: batch_size=%d total=%d rss=%.1f MB",
-                len(valid_ids),
-                total_embedded,
-                self._format_rss_mb(),
-            )
+        total_rows = pq.ParquetFile(path).metadata.num_rows
+        total_batches = (total_rows + 256 - 1) // 256
+        self.logger.info(
+            "Starting entity embedding: path=%s rows=%d batches=%d collection=%s",
+            path,
+            total_rows,
+            total_batches,
+            self.ENTITIY_CHROMA_NAME,
+        )
+
+        total_embedded = 0
+        with tqdm(total=total_batches, desc="Embedding entities") as pbar:
+            for batch in self._iter_parquet_batches(path, columns=["id", "canonical_name", "description", "cluster_id"], batch_size=256):
+                ids = batch["id"]
+                names = batch["canonical_name"]
+                descriptions = batch["description"]
+                cluster_ids = batch["cluster_id"]
+
+                texts = [
+                    f"{name}: {description}" if description else name
+                    for name, description in zip(names, descriptions)
+                ]
+
+                valid_idx = [i for i, text in enumerate(texts) if text]
+                if valid_idx:
+                    valid_ids = [ids[i] for i in valid_idx]
+                    valid_texts = [texts[i] for i in valid_idx]
+                    valid_metadata = [{"cluster_id": cluster_ids[i] if cluster_ids[i] is not None else -1} for i in valid_idx]
+
+                    embeddings = model.encode(
+                        valid_texts,
+                        batch_size=len(valid_texts),
+                        max_length=128,
+                        return_dense=True,
+                        return_sparse=False,
+                        return_colbert_vecs=False,
+                    )["dense_vecs"].tolist()
+
+                    collection.upsert(
+                        ids=valid_ids,
+                        embeddings=embeddings,
+                        metadatas=valid_metadata,
+                        documents=valid_texts,
+                    )
+                    total_embedded += len(valid_ids)
+
+                pbar.update(1)
         
         self.logger.info(
             "Entity embedding complete: total=%d saved to %s (collection=%s)",
@@ -274,39 +280,44 @@ class GraphGenerator:
         collection = client.get_or_create_collection(name=self.COMMUNITIES_CHROMA_NAME, metadata={"hnsw:space": "cosine"})
         model = BGEM3FlagModel(self.embed_model, use_fp16=True)
 
+        total_rows = pq.ParquetFile(path).metadata.num_rows
+        total_batches = (total_rows + 64 - 1) // 64
+        self.logger.info(
+            "Starting community embedding: path=%s rows=%d batches=%d collection=%s",
+            path,
+            total_rows,
+            total_batches,
+            self.COMMUNITIES_CHROMA_NAME,
+        )
+
         total_embedded = 0
-        for batch in self._iter_parquet_batches(path, columns=["cluster_id", "entities", "description"], batch_size=64):
-            ids = batch["cluster_id"]
-            texts = batch["description"]
+        with tqdm(total=total_batches, desc="Embedding communities") as pbar:
+            for batch in self._iter_parquet_batches(path, columns=["cluster_id", "entities", "description"], batch_size=64):
+                ids = batch["cluster_id"]
+                texts = batch["description"]
 
-            valid_idx = [i for i, text in enumerate(texts) if text]
-            if not valid_idx:
-                continue
+                valid_idx = [i for i, text in enumerate(texts) if text]
+                if valid_idx:
+                    valid_ids = [str(ids[i]) for i in valid_idx]
+                    valid_texts = [texts[i] for i in valid_idx]
 
-            valid_ids = [str(ids[i]) for i in valid_idx]
-            valid_texts = [texts[i] for i in valid_idx]
+                    embeddings = model.encode(
+                        valid_texts,
+                        batch_size=len(valid_texts),
+                        max_length=1024,  # num_predict=1000 needs real headroom, unlike entities' 128
+                        return_dense=True,
+                        return_sparse=False,
+                        return_colbert_vecs=False,
+                    )["dense_vecs"].tolist()
 
-            embeddings = model.encode(
-                valid_texts,
-                batch_size=len(valid_texts),
-                max_length=1024,  # num_predict=1000 needs real headroom, unlike entities' 128
-                return_dense=True,
-                return_sparse=False,
-                return_colbert_vecs=False,
-            )["dense_vecs"].tolist()
+                    collection.upsert(
+                        ids=valid_ids,
+                        embeddings=embeddings,
+                        documents=valid_texts,
+                    )
+                    total_embedded += len(valid_ids)
 
-            collection.upsert(
-                ids=valid_ids,
-                embeddings=embeddings,
-                documents=valid_texts,
-            )
-            total_embedded += len(valid_ids)
-            self.logger.info(
-                "Embedded community batch: batch_size=%d total=%d rss=%.1f MB",
-                len(valid_ids),
-                total_embedded,
-                self._format_rss_mb(),
-            )
+                pbar.update(1)
 
         self.logger.info(
             "Community embedding complete: total=%d saved to %s (collection=%s)",
@@ -328,6 +339,8 @@ class GraphGenerator:
         generator = dg.EntityDescriptionGenerator(self.CHUNKS_PATH, entity_path, self.ENTITIES_PATH, self.logger, model=self.desc_model, max_concurrent=self.max_concurrent)
         await generator.generate_descriptions()
         
+        self._embed_entities(self.ENTITIES_PATH)
+        
         # Generate the graph from the entities and relations
         graph = self._generate_graph(self.ENTITIES_PATH, relation_path)
         self._compute_clusters(graph)
@@ -338,4 +351,4 @@ class GraphGenerator:
         #Generate community descriptions
         community_generator = dg.CommunityDescriptionGenerator(self.COMMUNITIES_PATH, self.ENTITIES_PATH, self.COMMUNITIES_DESC_PATH, self.logger, model=self.desc_model, max_concurrent=self.max_concurrent)
         await community_generator.generate_descriptions()
-        
+        self._embed_communities(self.COMMUNITIES_PATH)
