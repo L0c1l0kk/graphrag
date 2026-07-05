@@ -344,11 +344,11 @@ class GraphGenerator:
         generator = dg.EntityDescriptionGenerator(self.CHUNKS_PATH, entity_path, self.ENTITIES_PATH, self.logger, model=self.desc_model, max_concurrent=self.max_concurrent)
         await generator.generate_descriptions()
         
-        self._embed_entities(self.ENTITIES_PATH)
-        
         # Generate the graph from the entities and relations
         graph = self._generate_graph(self.ENTITIES_PATH, relation_path)
         self._compute_clusters(graph)
+        
+        self._embed_entities(self.ENTITIES_PATH)
         
         # Create helper relation table for each community
         self._relations_for_community(self.ENTITIES_PATH, relation_path, self.COMMUNITIES_PATH)
