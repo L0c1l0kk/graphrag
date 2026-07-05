@@ -27,7 +27,7 @@ class GraphGenerator:
     
     ENTITIES_PATH="data/entities_with_descriptions"
     RELATIONS_PATH="data/relations"
-    COMMUNITIES_PATH="data/communities/"
+    COMMUNITIES_REL_PATH="data/communities/"
     COMMUNITIES_DESC_PATH="data/communities_with_descriptions"
     CHROMA_PATH="data/chroma_db"
     ENTITIY_CHROMA_NAME="entity_embeddings"
@@ -274,6 +274,7 @@ class GraphGenerator:
             "Entity embedding complete: total=%d saved to %s (collection=%s)",
             total_embedded,
             self.CHROMA_PATH,
+            self.ENTITIY_CHROMA_NAME,
         )
         
     def _embed_communities(self, path: str):
@@ -352,14 +353,14 @@ class GraphGenerator:
         self.logger.info("Entity embedding: %.2fs", time.perf_counter() - t0)
         
         t0 = time.perf_counter()
-        self._relations_for_community(self.ENTITIES_PATH, relation_path, self.COMMUNITIES_PATH)
+        self._relations_for_community(self.ENTITIES_PATH, relation_path, self.COMMUNITIES_REL_PATH)
         self.logger.info("Community relation table generation: %.2fs", time.perf_counter() - t0)
         
-        community_generator = dg.CommunityDescriptionGenerator(self.COMMUNITIES_PATH, self.ENTITIES_PATH, self.COMMUNITIES_DESC_PATH, self.logger, model=self.desc_model, max_concurrent=self.max_concurrent)
+        community_generator = dg.CommunityDescriptionGenerator(self.COMMUNITIES_REL_PATH, self.ENTITIES_PATH, self.COMMUNITIES_DESC_PATH, self.logger, model=self.desc_model, max_concurrent=self.max_concurrent)
         t0 = time.perf_counter()
         await community_generator.generate_descriptions()
         self.logger.info("Community description generation: %.2fs", time.perf_counter() - t0)
         
         t0 = time.perf_counter()
-        self._embed_communities(self.COMMUNITIES_PATH)
+        self._embed_communities(self.COMMUNITIES_DESC_PATH)
         self.logger.info("Community embedding: %.2fs", time.perf_counter() - t0)
