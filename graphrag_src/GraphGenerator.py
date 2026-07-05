@@ -1,4 +1,5 @@
 import logging
+import time
 from pathlib import Path
 from typing import Dict, Iterator, List
 
@@ -48,11 +49,6 @@ class GraphGenerator:
         self.desc_model=description_model_name or "llama3.1:8b-instruct-q4_K_M"
         self.embed_model=embed_model_name or "BAAI/bge-m3"
         self.logger = logging.getLogger(__name__)
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-            )
         if dataset_path=="wiki_dpr":
             ds = load_dataset("facebook/wiki_dpr", name="psgs_w100.nq.no_index.no_embeddings", split="train")
             self.CHUNKS_PATH=str(Path(ds.cache_files[0]["filename"]).parent)
@@ -333,27 +329,37 @@ class GraphGenerator:
 
     async def generate_graph(self) -> None:
         
-        # Generate entities and relations from the dataset
         extractor = self.extractor
+        t0 = time.perf_counter()
         extractor.generate()
+        self.logger.info("Entity/relation extraction: %.2fs", time.perf_counter() - t0)
         entity_path=extractor.ENTITIES_PATH
         relation_path=extractor.RELATIONS_PATH
         del extractor
         
-        #Generate entity descriptionjs
         generator = dg.EntityDescriptionGenerator(self.CHUNKS_PATH, entity_path, self.ENTITIES_PATH, self.logger, model=self.desc_model, max_concurrent=self.max_concurrent)
+        t0 = time.perf_counter()
         await generator.generate_descriptions()
+        self.logger.info("Entity description generation: %.2fs", time.perf_counter() - t0)
         
-        # Generate the graph from the entities and relations
+        t0 = time.perf_counter()
         graph = self._generate_graph(self.ENTITIES_PATH, relation_path)
         self._compute_clusters(graph)
+        self.logger.info("Graph construction and clustering: %.2fs", time.perf_counter() - t0)
         
+        t0 = time.perf_counter()
         self._embed_entities(self.ENTITIES_PATH)
+        self.logger.info("Entity embedding: %.2fs", time.perf_counter() - t0)
         
-        # Create helper relation table for each community
+        t0 = time.perf_counter()
         self._relations_for_community(self.ENTITIES_PATH, relation_path, self.COMMUNITIES_PATH)
+        self.logger.info("Community relation table generation: %.2fs", time.perf_counter() - t0)
         
-        #Generate community descriptions
         community_generator = dg.CommunityDescriptionGenerator(self.COMMUNITIES_PATH, self.ENTITIES_PATH, self.COMMUNITIES_DESC_PATH, self.logger, model=self.desc_model, max_concurrent=self.max_concurrent)
+        t0 = time.perf_counter()
         await community_generator.generate_descriptions()
+        self.logger.info("Community description generation: %.2fs", time.perf_counter() - t0)
+        
+        t0 = time.perf_counter()
         self._embed_communities(self.COMMUNITIES_PATH)
+        self.logger.info("Community embedding: %.2fs", time.perf_counter() - t0)
