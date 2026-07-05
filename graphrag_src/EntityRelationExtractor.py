@@ -55,7 +55,7 @@ class EntityRelationExtractor:
 
     def __init__(
         self,
-        ner_model: Optional[BaseGLiNER] = None,
+        ner_model: str | None = None,
         embed_model: Any = None,
         chunk_size: int = 100,
         chunk_overlap: int = 20,
@@ -68,7 +68,7 @@ class EntityRelationExtractor:
     ):
         """
         Args:
-            model: Pre-loaded GLiNER-Relex model.  Defaults to
+            ner_model: Path to or name of the GLiNER-Relex model.  Defaults to
                 knowledgator/gliner-relex-large-v1.0 from HF Hub.
             chunk_size: Words per chunk when splitting raw text.
             chunk_overlap: Overlap words between consecutive chunks.
@@ -133,18 +133,7 @@ class EntityRelationExtractor:
         Dataset.from_generator(
             lambda: self._chunk_generator(dataset)
         ).save_to_disk(output_dir)
-        
-        
-        if self.ner_model is None:
-            self.logger.info("Loading default GLiNER model from hub")
-            self.ner_model = GLiNER.from_pretrained("knowledgator/gliner-relex-large-v1.0")
-        device= "cuda" if torch.cuda.is_available() else "cpu"
-        self.ner_model.to(device)
-        self.logger.info("Using device: %s", device)
-        
-        
-        del self.ner_model
-        self.logger.info("Finished chunk generation and released ner_model")
+        self.logger.info("Finished chunk generation")
 
     def load_chunks(self) -> (Dataset | IterableDataset):
         self.logger.info("Loading chunks from %s", self.chunks_path)
@@ -161,7 +150,7 @@ class EntityRelationExtractor:
     # Extraction
     
 
-    def _process_batch(self, batch: List[Dict]) -> List[Dict]:
+    def _process_batch(self, batch: List[Dict], model : BaseGLiNER ) -> List[Dict]:
         """
         Run joint NER + RE on a list of chunk dicts in a single forward pass.
 
@@ -176,7 +165,7 @@ class EntityRelationExtractor:
         texts = [item["text"] for item in batch]
         self.logger.debug("Processing batch of %d texts", len(texts))
 
-        entities_all, relations_all = self.ner_model.inference(
+        entities_all, relations_all = model.inference(
             texts=texts,
             labels=self.entity_labels,
             relations=self.relation_labels,
@@ -289,7 +278,8 @@ class EntityRelationExtractor:
             self.logger.info("Initializing embedding model for entity merge")
             self.embed_model=BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
 
-        for label in entities_df["label"].unique().to_list():
+        labels = entities_df["label"].unique().to_list()
+        for label in tqdm(labels, desc="Merging entities"):
             self.logger.debug("Merging entities for label=%s", label)
             rows = entities_df.filter(pl.col("label") == label).to_dicts()
             if not rows:
@@ -302,7 +292,7 @@ class EntityRelationExtractor:
                 return_dense=True,
                 return_sparse=False,
                 return_colbert_vecs=False,
-            )["dense_vecs"].astype(np.float32) 
+            )["dense_vecs"].astype(np.float16) 
 
             faiss.normalize_L2(embeddings)
             index = faiss.IndexFlatIP(embeddings.shape[1]) 
@@ -478,12 +468,20 @@ class EntityRelationExtractor:
                     self.logger.info("Flushing %d relation rows to %s", len(relation_rows), self.RELATIONS_PATH)
                     relation_rows.clear()
 
+            #loading model
+            self.logger.info("Loading GLiNER-Relex model for extraction")
+            model_name= self.ner_model or "knowledgator/gliner-relex-large-v1.0"
+            model= GLiNER.from_pretrained(model_name)
+            device= "cuda" if torch.cuda.is_available() else "cpu"
+            model.to(device)
+            self.logger.info("Using device: %s", device)
+            
             total_batches = (self._n_chunks + batch_size - 1) // batch_size
             with tqdm(total=total_batches, desc="Extracting") as pbar:
                 for batch in chunks.iter(batch_size=batch_size):
                     batch_dict = cast(Dict[str, List[Any]], batch)
                     records = [dict(zip(batch_dict.keys(), vals)) for vals in zip(*batch_dict.values())]
-                    for result in self._process_batch(records):
+                    for result in self._process_batch(records, model):
                         cid = result["chunk_id"]
                         entity_rows.extend(
                             {"chunk_id": cid, "text": e["text"], "label": e["label"]}
@@ -506,7 +504,7 @@ class EntityRelationExtractor:
         relations_db = self._index_relations(self.RELATIONS_PATH, entity_map)
         
         self._save_inplace(relations_db, self.RELATIONS_PATH)
-        self._save_inplace(pl.from_dict(entity_db), self.ENTITIES_PATH)
+        self._save_inplace(pl.DataFrame(entity_db), self.ENTITIES_PATH)
         self.logger.info("Extraction pipeline completed successfully")
         
         return entity_db
