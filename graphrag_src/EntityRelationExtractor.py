@@ -125,14 +125,6 @@ class EntityRelationExtractor:
         """
         Generates chunks and saves them to disk into output_dir, load with datasets.load_from_disk()
         """
-        if self.ner_model is None:
-            self.logger.info("Loading default GLiNER model from hub")
-            self.ner_model = GLiNER.from_pretrained("knowledgator/gliner-relex-large-v1.0")
-        device= "cuda" if torch.cuda.is_available() else "cpu"
-        self.ner_model.to(device)
-        self.logger.info("Using device: %s", device)
-        
-        # add argument and description in generate
         if path=="wiki_dpr":
             self.logger.info("Dataset %s already chunked; skipping generation", path)
             return
@@ -142,6 +134,15 @@ class EntityRelationExtractor:
             lambda: self._chunk_generator(dataset)
         ).save_to_disk(output_dir)
         
+        
+        if self.ner_model is None:
+            self.logger.info("Loading default GLiNER model from hub")
+            self.ner_model = GLiNER.from_pretrained("knowledgator/gliner-relex-large-v1.0")
+        device= "cuda" if torch.cuda.is_available() else "cpu"
+        self.ner_model.to(device)
+        self.logger.info("Using device: %s", device)
+        
+        
         del self.ner_model
         self.logger.info("Finished chunk generation and released ner_model")
 
@@ -149,7 +150,7 @@ class EntityRelationExtractor:
         self.logger.info("Loading chunks from %s", self.chunks_path)
         if self.chunks_path=="wiki_dpr":
             ds = load_dataset("facebook/wiki_dpr", name="psgs_w100.nq.no_index.no_embeddings", split="train")
-            ds=ds.train_test_split(test_size=0.25, seed=42)["test"]
+            ds=ds.select(range(100)) # for testing
             self._n_chunks=len(ds)
         else:
             ds = load_from_disk(self.chunks_path)
