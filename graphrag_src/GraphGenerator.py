@@ -48,6 +48,11 @@ class GraphGenerator:
         self.desc_model=description_model_name or "llama3.1:8b-instruct-q4_K_M"
         self.embed_model=embed_model_name or "BAAI/bge-m3"
         self.logger = logging.getLogger(__name__)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+            )
         if dataset_path=="wiki_dpr":
             ds = load_dataset("facebook/wiki_dpr", name="psgs_w100.nq.no_index.no_embeddings", split="train")
             self.CHUNKS_PATH=str(Path(ds.cache_files[0]["filename"]).parent)

@@ -623,9 +623,9 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
         the ids out with a real regex.
         """
         base = Path(self.input_path)
-        name_pattern = re.compile(rf"^{re.escape(base.name)}_community_(\d+)_relations\.parquet$")
+        name_pattern = re.compile(r"^_community_(\d+)_relations\.parquet$")
         ids = []
-        for f in base.parent.glob(f"{base.name}_community_*_relations.parquet"):
+        for f in base.glob("_community_*_relations.parquet"):
             m = name_pattern.match(f.name)
             if m:
                 ids.append(int(m.group(1)))
