@@ -356,9 +356,9 @@ class EntityRelationExtractor:
         """Save a Polars DataFrame to a Parquet file, overwriting the original."""
         temp_path = f"{path}.tmp"
         try:
-            if(df is pl.LazyFrame):
+            if(isinstance(df, pl.LazyFrame)):
                 df.sink_parquet(temp_path)
-            elif (df is pl.DataFrame):
+            elif (isinstance(df, pl.DataFrame)):
                 df.write_parquet(temp_path)
             os.replace(temp_path, path)
         except Exception as e:
