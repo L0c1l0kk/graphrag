@@ -19,7 +19,7 @@ import polars as pl
 
 
 class DescriptionGenerator(ABC):
-    def __init__(self, input_path, entity_db_path, output_path, logger: logging.Logger, flush_every: int = 1000, max_concurrent: int = 32, model: str | None = None):
+    def __init__(self, input_path, entity_db_path, output_path, logger: logging.Logger, flush_every: int = 1000, max_concurrent: int = 8, model: str | None = None):
         self.logger = logger
         self.flush_every = flush_every
         self.output_path = output_path
@@ -39,6 +39,7 @@ class DescriptionGenerator(ABC):
         # Row count for the progress bar, set cheaply from Parquet metadata
         # (footer only — doesn't require reading/loading the actual rows).
         self._total: int | None = None
+        self._index_path: str | None = None
 
     _SCHEMA = None
     _PROMPT = None
@@ -99,6 +100,22 @@ class DescriptionGenerator(ABC):
         # tokenizers on English text. Swap for a real tokenizer if you need
         # this to be exact rather than a conservative upper bound.
         return max(1, len(text) // 4)
+    
+    def _index_is_valid(self) -> bool:
+        """True if chunk_index_path is a DuckDB file with a queryable
+        'chunks' table (i.e. a build actually completed), not just a stub
+        file that duckdb.connect() creates on disk before any table exists."""
+        try:
+            if self._index_path is None:
+                raise ValueError("Index path not set")
+            con = duckdb.connect(self._index_path, read_only=True)
+            try:
+                con.execute("SELECT 1 FROM chunks LIMIT 1")
+                return True
+            finally:
+                con.close()
+        except duckdb.Error:
+            return False
 
 
 class EntityDescriptionGenerator(DescriptionGenerator):
@@ -125,10 +142,10 @@ class EntityDescriptionGenerator(DescriptionGenerator):
     _HARD_CAP_BEFORE_CLUSTERING = 5000    # safety valve before even clustering
 
     def __init__(self, *args, chunk_index_path: str | None = None, entity_batch_size: int = 2000,
-                 input_format: str | None = None, chunk_id_column: str = "chunk_id",
+                 input_format: str | None = None, chunk_id_column: str = "id",
                  text_column: str = "text", **kwargs):
         super().__init__(*args, **kwargs)
-        self.chunk_index_path = chunk_index_path or f"{self.input_path}.chunks.duckdb"
+        self._index_path = chunk_index_path or f"{self.input_path}.chunks.duckdb"
         self.entity_batch_size = entity_batch_size
         # "parquet" (default, unchanged behavior) or "arrow" — a single
         # memory-mapped .arrow file or a directory of HF-datasets-style
@@ -169,14 +186,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
 
     # -------------------------------------------------------------------------
     # Evidence selection (MMR under a token budget, over an entity's mentions)
-    #
-    # No chunk-level embeddings exist (and none are being generated), so this
-    # uses the *original* MMR formulation (Carbonell & Goldstein, 1998), which
-    # was TF-IDF-based to begin with — not a fallback approximation. A fresh
-    # TF-IDF space is fit per entity, over just that entity's own candidate
-    # excerpts (at most a few hundred short texts after downsampling), so this
-    # is cheap, local, and needs no embedding model or GPU at all.
-    # -------------------------------------------------------------------------
+    # tf-idf MMR
 
     @staticmethod
     def _tfidf(texts: list[str]):
@@ -222,7 +232,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
     def _select_excerpts(self, candidates: list[dict]) -> list[str]:
         """MMR selection under a token budget, in TF-IDF space.
 
-        candidates: [{"chunk_id", "text"}, ...] for every chunk that mentions
+        candidates: [{"id", "text"}, ...] for every chunk that mentions
         this entity.
 
         "Relevance" is similarity to the centroid of the entity's own
@@ -306,16 +316,62 @@ class EntityDescriptionGenerator(DescriptionGenerator):
             mm.seek(0)
             return pa.ipc.open_stream(mm).read_all()
 
-    @classmethod
-    def _load_arrow_source(cls, input_path: str) -> pa.Table:
+    def _load_arrow_source(self, input_path: str) -> pa.Table:
         """Load a single .arrow file or a directory of shards (e.g. a
         wiki_dpr cache dir) into one Table. Shards are memory-mapped and
-        concatenated without copying the underlying buffers."""
+        concatenated without copying the underlying buffers.
+
+        A naive glob of *.arrow in an HF `datasets` save_to_disk directory
+        can also pick up unrelated cache-*.arrow files that `datasets`
+        leaves behind from earlier .map()/index-building calls run against
+        the same cache dir. Those have whatever schema that earlier
+        operation produced (e.g. a lone "indices" column) and blow up
+        pa.concat_tables when mixed with the real id/text/title shards.
+        To avoid that: prefer the exact file list recorded in state.json
+        (the source of truth for which files belong to the dataset) when
+        present, and otherwise fall back to filtering the glob results down
+        to shards that actually contain chunk_id_column/text_column,
+        logging a warning for anything skipped.
+        """
         p = Path(input_path)
-        files = sorted(p.glob("*.arrow")) if p.is_dir() else [p]
+        if not p.is_dir():
+            return self._read_arrow_file(p)
+
+        files: list[Path] = []
+        state_path = p / "state.json"
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text())
+                candidate = [p / f["filename"] for f in state.get("_data_files", [])]
+                files = [f for f in candidate if f.exists()]
+            except (json.JSONDecodeError, KeyError, OSError) as exc:
+                self.logger.warning("Could not parse %s (%s); falling back to glob", state_path, exc)
+                files = []
+
+        if not files:
+            files = sorted(p.glob("*.arrow"))
         if not files:
             raise FileNotFoundError(f"No .arrow files found under {input_path}")
-        tables = [cls._read_arrow_file(f) for f in files]
+
+        tables = [self._read_arrow_file(f) for f in files]
+
+        if not state_path.exists():
+            wanted = {self.chunk_id_column, self.text_column}
+            kept, skipped = [], []
+            for f, t in zip(files, tables):
+                (kept if wanted.issubset(t.schema.names) else skipped).append((f, t))
+            if skipped:
+                self.logger.warning(
+                    "Skipping %d .arrow file(s) under %s missing columns %s "
+                    "(likely a stray datasets cache/map file, not the source table): %s",
+                    len(skipped), input_path, sorted(wanted), [str(f) for f, _ in skipped],
+                )
+            tables = [t for _, t in kept]
+            if not tables:
+                raise ValueError(
+                    f"No .arrow files under {input_path} contain required columns {sorted(wanted)}"
+                )
+
         return tables[0] if len(tables) == 1 else pa.concat_tables(tables)
 
     def _ensure_chunk_index(self) -> str:
@@ -324,7 +380,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         ~21M-row table, not a full join+sort of it. Reused across runs.
 
         Assumes chunk_db (self.input_path) has a chunk-id column and a text
-        column (named "chunk_id"/"text" by default — override via
+        column (named "id"/"text" by default — override via
         chunk_id_column/text_column, e.g. for wiki_dpr's "id"/"text").
         Source can be Parquet (self.input_format == "parquet", the original
         behavior) or Arrow (self.input_format == "arrow"; a single .arrow
@@ -333,9 +389,31 @@ class EntityDescriptionGenerator(DescriptionGenerator):
 
         (No embedding column needed — evidence selection runs on TF-IDF
         vectors fit locally per entity, not on precomputed chunk embeddings.)
+
+        Builds are atomic: duckdb.connect() creates a file on disk the
+        moment you connect, before any table exists, so a build that dies
+        partway through (a raised exception, or an OOM kill on a 21M-row
+        table with only 16GB RAM) can leave a stub/partial .duckdb file
+        sitting at chunk_index_path. A bare os.path.exists() check can't
+        tell that apart from a finished index, and a later run would skip
+        straight to querying a "chunks" table that was never created. To
+        avoid that: any existing file is validated (and rebuilt if it's
+        just a stub), and new builds happen in a temp file that's only
+        renamed into place after the table + index both succeed.
         """
-        if not os.path.exists(self.chunk_index_path):
-            con = duckdb.connect(self.chunk_index_path)
+        if os.path.exists(self._index_path) and not self._index_is_valid():
+            self.logger.warning(
+                "%s exists but has no usable 'chunks' table (likely left over "
+                "from a crashed/interrupted build); rebuilding it",
+                self._index_path,
+            )
+            os.remove(self._index_path)
+
+        if not os.path.exists(self._index_path):
+            tmp_path = f"{self._index_path}.building"
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)  # leftover from a previous crashed build
+            con = duckdb.connect(tmp_path)
             try:
                 con.execute("PRAGMA memory_limit='6GB'")
                 if self.input_format == "arrow":
@@ -344,7 +422,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                     try:
                         con.execute(
                             f'CREATE TABLE chunks AS SELECT '
-                            f'CAST("{self.chunk_id_column}" AS VARCHAR) AS chunk_id, '
+                            f'CAST("{self.chunk_id_column}" AS VARCHAR) AS id, '
                             f'CAST("{self.text_column}" AS VARCHAR) AS text '
                             f'FROM chunks_src'
                         )
@@ -353,13 +431,19 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                 else:
                     con.execute(
                         "CREATE TABLE chunks AS "
-                        "SELECT chunk_id, text FROM read_parquet(?)",
+                        "SELECT id, text FROM read_parquet(?)",
                         [self.input_path],
                     )
-                con.execute("CREATE UNIQUE INDEX chunks_pk ON chunks(chunk_id)")
-            finally:
+                con.execute("CREATE UNIQUE INDEX chunks_pk ON chunks(id)")
+            except Exception:
                 con.close()
-        return self.chunk_index_path
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)  # don't leave a stub for next run to trust
+                raise
+            else:
+                con.close()
+                os.replace(tmp_path, self._index_path)  # atomic on POSIX
+        return self._index_path
 
     def _scan(self, loop: asyncio.AbstractEventLoop) -> None:
         """Runs in a worker thread (see DescriptionGenerator._collect).
@@ -390,11 +474,11 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                 wanted = sorted({cid for e in entities for cid in (e["source_chunks"] or [])})
                 chunk_lookup: dict[str, str] = {}
                 if wanted:
-                    con.register("wanted_ids", pa.table({"chunk_id": wanted}))
+                    con.register("wanted_ids", pa.table({"id": wanted}))
                     try:
                         rows = con.execute(
-                            "SELECT c.chunk_id, c.text "
-                            "FROM chunks c JOIN wanted_ids w USING (chunk_id)"
+                            "SELECT c.id, c.text "
+                            "FROM chunks c JOIN wanted_ids w USING (id)"
                         ).fetchall()
                     finally:
                         con.unregister("wanted_ids")
@@ -405,7 +489,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                     for cid in (e["source_chunks"] or []):
                         text = chunk_lookup.get(cid)
                         if text is not None:
-                            candidates.append({"chunk_id": cid, "text": text})
+                            candidates.append({"id": cid, "text": text})
 
                     excerpts = self._select_excerpts(candidates)
                     record = {
@@ -445,7 +529,7 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
     
     def __init__(self, *args, entity_index_path: str | None = None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.entity_index_path = entity_index_path or f"{self.input_path}.entities.duckdb"
+        self._index_path = entity_index_path or f"{self.input_path}.entities.duckdb"
         self.ready: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=6000)
         self._community_ids: list[int] | None = None
     
@@ -461,7 +545,7 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
             response = await self.client.generate(
                 model=self.model,
                 prompt=prompt,
-                options={"temperature": 0.1, "num_predict": 150},
+                options={"temperature": 0.1, "num_predict": 1000},
             )
         description = response["response"].strip()
 
@@ -481,8 +565,16 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
 
         Assumes entity_db (entity_path) has columns: id, canonical_name, label, description.
         """
-        if not os.path.exists(self.entity_index_path):
-            con = duckdb.connect(self.entity_index_path)
+        if os.path.exists(self._index_path) and not self._index_is_valid():
+            self.logger.warning(
+                "%s exists but has no usable 'chunks' table (likely left over "
+                "from a crashed/interrupted build); rebuilding it",
+                self._index_path,
+            )
+            os.remove(self._index_path)
+        
+        if not os.path.exists(self._index_path):
+            con = duckdb.connect(self._index_path)
             try:
                 con.execute("PRAGMA memory_limit='6GB'")
                 con.execute(
@@ -493,7 +585,7 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
                 con.execute("CREATE UNIQUE INDEX entities_pk ON entities(id)")
             finally:
                 con.close()
-        return self.entity_index_path
+        return self._index_path
     
     def _get_top_k_by_degree(self, cluster_id: str, input_path: str, k: int) -> pl.DataFrame:
         """Compute top k relationships by degree (in + out) weighted by edge weights for a given community."""
@@ -540,7 +632,7 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
     def _scan(self, loop: asyncio.AbstractEventLoop) -> None:
         
         self._ensure_entity_index()
-        con=duckdb.connect(self.entity_index_path, read_only=True)
+        con=duckdb.connect(self._index_path, read_only=True)
         con.execute("PRAGMA memory_limit='6GB'")
         
         community_ids = self._community_ids if self._community_ids is not None else self._discover_community_ids()
