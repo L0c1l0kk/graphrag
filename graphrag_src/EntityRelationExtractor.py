@@ -139,7 +139,7 @@ class EntityRelationExtractor:
         self.logger.info("Loading chunks from %s", self.chunks_path)
         if self.chunks_path=="wiki_dpr":
             ds = load_dataset("facebook/wiki_dpr", name="psgs_w100.nq.no_index.no_embeddings", split="train")
-            ds=ds.select(range(100)) # for testing
+            ds=ds.select(range(1000)) # for testing
             self._n_chunks=len(ds)
         else:
             ds = load_from_disk(self.chunks_path)
@@ -292,7 +292,7 @@ class EntityRelationExtractor:
                 return_dense=True,
                 return_sparse=False,
                 return_colbert_vecs=False,
-            )["dense_vecs"].astype(np.float16) 
+            )["dense_vecs"].astype(np.float32) 
 
             faiss.normalize_L2(embeddings)
             index = faiss.IndexFlatIP(embeddings.shape[1]) 
