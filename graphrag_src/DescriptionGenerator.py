@@ -142,7 +142,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
     _MAX_CANDIDATES_FOR_MMR = 200         # cap MMR's O(k*n) cost for hub entities
     _HARD_CAP_BEFORE_CLUSTERING = 5000    # safety valve before even clustering
 
-    def __init__(self, *args, chunk_index_path: str | None = None, entity_batch_size: int = 2000,
+    def __init__(self, *args, chunk_index_path: str | None = None, entity_batch_size: int = 500,
                  input_format: str | None = None, chunk_id_column: str = "id",
                  text_column: str = "text", **kwargs):
         super().__init__(*args, **kwargs)
@@ -239,9 +239,6 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         "Relevance" is similarity to the centroid of the entity's own
         candidate texts — prefer excerpts representative of how the entity is
         typically discussed, then diversify away from what's already picked.
-        Every candidate already mentions the entity by construction (that's
-        why it's in source_chunks), so this is really doing redundancy
-        reduction more than topical filtering.
         """
         if not candidates:
             return []
@@ -279,7 +276,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
             cost = self._estimate_tokens(candidates[best]["text"])
 
             if selected and cost > budget:
-                remaining.discard(best)  # doesn't fit this round; let a cheaper one win
+                remaining.discard(best)
                 continue
 
             selected.append(best)
@@ -472,7 +469,13 @@ class EntityDescriptionGenerator(DescriptionGenerator):
             ):
                 entities = batch.to_pylist()
 
+                for e in entities:
+                    sc = e["source_chunks"] or []
+                    if len(sc) > self._HARD_CAP_BEFORE_CLUSTERING:
+                        e["source_chunks"] = random.Random(0).sample(sc, self._HARD_CAP_BEFORE_CLUSTERING)
+                
                 wanted = sorted({cid for e in entities for cid in (e["source_chunks"] or [])})
+
                 chunk_lookup: dict[str, str] = {}
                 if wanted:
                     con.register("wanted_ids", pa.table({"id": wanted}))
