@@ -16,6 +16,14 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 import polars as pl
+from pympler import asizeof
+
+import psutil
+
+process = psutil.Process(os.getpid())
+
+def mem():
+    return process.memory_info().rss / 1024**3
 
 
 class DescriptionGenerator(ABC):
@@ -51,11 +59,15 @@ class DescriptionGenerator(ABC):
             if not force and len(self.buffer) < self.flush_every:
                 return
             batch = self.buffer
+            buffer_len = len(batch)
+            buffer_size_mb = asizeof.asizeof(batch) / (1024 ** 2)
             self.buffer = []
+        self.logger.info(f"Flushing buffer: {buffer_len} records (~{buffer_size_mb:.1f} MB) | Mem: {mem():.2f} GB")
         table= pa.table({f.name : [r[f.name] for r in batch] for f in self._SCHEMA}, schema=self._SCHEMA)
         if self.writer is None:
             self.writer = pq.ParquetWriter(self.output_path, self._SCHEMA, compression="zstd")
         self.writer.write_table(table)
+        self.logger.debug(f"Flush complete | Mem: {mem():.2f} GB")
 
     @abstractmethod
     def _scan(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -64,8 +76,10 @@ class DescriptionGenerator(ABC):
         finish with a single None sentinel."""
 
     async def _collect(self) -> None:
+        self.logger.info(f"Starting collect phase | Mem: {mem():.2f} GB")
         loop = asyncio.get_running_loop()
         await asyncio.to_thread(self._scan, loop)
+        self.logger.info(f"Collect phase complete | Queue size: {self.ready.qsize()} | Mem: {mem():.2f} GB")
 
     @abstractmethod
     async def _describe(self, record: dict, pbar: tqdm) -> None:
@@ -76,22 +90,30 @@ class DescriptionGenerator(ABC):
             item = await self.ready.get()
             if item is None:
                 await self.ready.put(None)  # re-broadcast so sibling workers also exit
+                self.logger.debug(f"Worker exiting | Queue size: {self.ready.qsize()} | Mem: {mem():.2f} GB")
                 break
+            queue_size = self.ready.qsize()
+            if queue_size % 100 == 0:  # Log every 100 items to avoid spam
+                self.logger.debug(f"Worker processing | Queue size: {queue_size} | Buffer size: {len(self.buffer)} | Mem: {mem():.2f} GB")
             await self._describe(item, pbar)
 
     async def _consume(self, pbar: tqdm) -> None:
+        self.logger.info(f"Starting consume phase with {self.max_concurrent} workers | Mem: {mem():.2f} GB")
         workers = [asyncio.create_task(self._worker(pbar)) for _ in range(self.max_concurrent)]
         await asyncio.gather(*workers)
+        self.logger.info(f"All workers finished | Buffer size: {len(self.buffer)} | Mem: {mem():.2f} GB")
         await self._flush(force=True)
         if self.writer:
             self.writer.close()
+        self.logger.info(f"Consume phase complete | Mem: {mem():.2f} GB")
 
     async def generate_descriptions(self) -> str:
         if self._total is None:
             raise ValueError("Row count (self._total) not set — did the subclass set it before calling super()?")
+        self.logger.info(f"Starting description generation for {self._total} items | Mem: {mem():.2f} GB")
         with tqdm(total=self._total, desc="Generating descriptions") as pbar:
             await asyncio.gather(self._collect(), self._consume(pbar))
-
+        self.logger.info(f"Description generation complete | Output: {self.output_path} | Mem: {mem():.2f} GB")
         return self.output_path
     
     @staticmethod
@@ -156,6 +178,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         self.text_column = text_column
 
     async def _describe(self, record: dict, pbar: tqdm) -> None:
+        mem_before = mem()
         excerpts = record["excerpts"]
         if not excerpts:
             description = f"A {record['label']} named {record['canonical_name']}."
@@ -165,6 +188,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                 entity_type=record["label"],
                 excerpts="\n---\n".join(excerpts),
             )
+            prompt_size_kb = len(prompt) / 1024
             async with self.semaphore:
                 response = await self.client.generate(
                     model=self.model,
@@ -182,6 +206,11 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                 "description":    description,
                 "source_chunks":  record["source_chunks"],
             })
+            buffer_len = len(self.buffer)
+        mem_after = mem()
+        mem_delta = mem_after - mem_before
+        if buffer_len % 50 == 0:  # Log every 50 buffered items
+            self.logger.debug(f"Record {record['id'][:20]}... buffered | Buffer: {buffer_len} | Mem Δ: {mem_delta:+.3f} GB | Total: {mem_after:.2f} GB")
         await self._flush()
         pbar.update(1)
 
@@ -247,6 +276,9 @@ class EntityDescriptionGenerator(DescriptionGenerator):
 
         if len(candidates) > self._MAX_CANDIDATES_FOR_MMR:
             candidates = self._cluster_downsample(candidates, self._MAX_CANDIDATES_FOR_MMR)
+
+        candidates_size_mb = asizeof.asizeof(candidates) / (1024 ** 2)
+        self.logger.debug(f"MMR selection: {len(candidates)} candidates (~{candidates_size_mb:.1f} MB) | Mem: {mem():.2f} GB")
 
         tfidf = self._tfidf([c["text"] for c in candidates])
         # Bounded to <= _MAX_CANDIDATES_FOR_MMR rows, so a dense pairwise
@@ -460,14 +492,19 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         chunk_db = self._ensure_chunk_index()
         con = duckdb.connect(chunk_db, read_only=True)
         con.execute("PRAGMA memory_limit='6GB'")
+        self.logger.info(f"_scan started | Chunk index: {chunk_db} | Mem: {mem():.2f} GB")
 
         try:
             pf = pq.ParquetFile(self.entity_db_path)
+            batch_num = 0
             for batch in pf.iter_batches(
                 batch_size=self.entity_batch_size,
                 columns=["id", "canonical_name", "label", "source_chunks"],
             ):
+                batch_num += 1
+                mem_start = mem()
                 entities = batch.to_pylist()
+                batch_size_mb = asizeof.asizeof(entities) / (1024 ** 2)
 
                 for e in entities:
                     sc = e["source_chunks"] or []
@@ -487,6 +524,9 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                     finally:
                         con.unregister("wanted_ids")
                     chunk_lookup = {chunk_id: text for chunk_id, text in rows}
+                    lookup_size_mb = asizeof.asizeof(chunk_lookup) / (1024 ** 2)
+                else:
+                    lookup_size_mb = 0
 
                 for e in entities:
                     candidates = []
@@ -504,9 +544,17 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                         "excerpts": excerpts,
                     }
                     asyncio.run_coroutine_threadsafe(self.ready.put(record), loop).result()
+                
+                mem_end = mem()
+                if batch_num % 10 == 0:
+                    self.logger.debug(
+                        f"Batch {batch_num}: {len(entities)} entities (~{batch_size_mb:.1f} MB + lookup ~{lookup_size_mb:.1f} MB) | "
+                        f"Queue: {self.ready.qsize()} | Mem: {mem_end:.2f} GB (Δ {mem_end - mem_start:+.3f} GB)"
+                    )
         finally:
             con.close()
-
+        
+        self.logger.info(f"_scan phase complete | Total batches: {batch_num} | Final queue: {self.ready.qsize()} | Mem: {mem():.2f} GB")
         asyncio.run_coroutine_threadsafe(self.ready.put(None), loop).result()
 
     async def generate_descriptions(self) -> str:
