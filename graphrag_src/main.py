@@ -1,10 +1,17 @@
 import asyncio
+import logging
 import time
  
 from GraphGenerator import GraphGenerator
+
+# Configure logging at entry point
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
  
  
-generator = GraphGenerator(max_concurrent=8)
+generator = GraphGenerator(max_concurrent=4)
 start = time.perf_counter()
 asyncio.run(generator.generate_graph())
 elapsed = time.perf_counter() - start

@@ -86,15 +86,35 @@ class DescriptionGenerator(ABC):
         pass
 
     async def _worker(self, pbar: tqdm) -> None:
+        items_processed = 0
+        chunks_processed = 0
+        self.logger.info(f"Worker started | Mem: {mem():.2f} GB")
         while True:
             item = await self.ready.get()
             if item is None:
                 await self.ready.put(None)  # re-broadcast so sibling workers also exit
-                self.logger.debug(f"Worker exiting | Queue size: {self.ready.qsize()} | Mem: {mem():.2f} GB")
+                queue_items = list(self.ready._queue) if hasattr(self.ready, '_queue') else []
+                queue_mem_mb = sum(asizeof.asizeof(qi) for qi in queue_items) / (1024 ** 2) if queue_items else 0
+                self.logger.info(
+                    f"Worker exiting | Items processed: {items_processed}, Chunks processed: {chunks_processed} | "
+                    f"Queue size: {self.ready.qsize()} items (~{queue_mem_mb:.2f} MB) | Mem: {mem():.2f} GB"
+                )
                 break
+            
+            item_chunks = len(item.get("source_chunks") or [])
+            chunks_processed += item_chunks
+            items_processed += 1
             queue_size = self.ready.qsize()
-            if queue_size % 100 == 0:  # Log every 100 items to avoid spam
-                self.logger.debug(f"Worker processing | Queue size: {queue_size} | Buffer size: {len(self.buffer)} | Mem: {mem():.2f} GB")
+            queue_items = list(self.ready._queue) if hasattr(self.ready, '_queue') else []
+            queue_mem_mb = sum(asizeof.asizeof(qi) for qi in queue_items) / (1024 ** 2) if queue_items else 0
+            
+            if items_processed % 20 == 0:  # Log every 20 items
+                self.logger.info(
+                    f"Worker progress | Items: {items_processed}, Chunks: {chunks_processed} | "
+                    f"Current item chunks: {item_chunks} | Queue remaining: {queue_size} items (~{queue_mem_mb:.2f} MB) | "
+                    f"Buffer size: {len(self.buffer)} | Mem: {mem():.2f} GB"
+                )
+            
             await self._describe(item, pbar)
 
     async def _consume(self, pbar: tqdm) -> None:
@@ -159,10 +179,10 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         )
 
     # --- evidence-selection knobs -------------------------------------------------
-    _TOKEN_BUDGET = 2000                  # excerpts-block token budget per prompt
+    _TOKEN_BUDGET = 4000                  # excerpts-block token budget per prompt
     _MMR_LAMBDA = 0.7                     # 1.0 = pure relevance, 0.0 = pure diversity
     _MAX_CANDIDATES_FOR_MMR = 200         # cap MMR's O(k*n) cost for hub entities
-    _HARD_CAP_BEFORE_CLUSTERING = 5000    # safety valve before even clustering
+    _HARD_CAP_BEFORE_CLUSTERING = 1000    # Amount of source_chunks allowed at once so no OOM happens on 16gb ram
 
     def __init__(self, *args, chunk_index_path: str | None = None, entity_batch_size: int = 500,
                  input_format: str | None = None, chunk_id_column: str = "id",
@@ -497,6 +517,8 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         try:
             pf = pq.ParquetFile(self.entity_db_path)
             batch_num = 0
+            total_chunks_queued = 0
+            total_entities_queued = 0
             for batch in pf.iter_batches(
                 batch_size=self.entity_batch_size,
                 columns=["id", "canonical_name", "label", "source_chunks"],
@@ -504,37 +526,53 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                 batch_num += 1
                 mem_start = mem()
                 entities = batch.to_pylist()
-                batch_size_mb = asizeof.asizeof(entities) / (1024 ** 2)
 
                 for e in entities:
                     sc = e["source_chunks"] or []
                     if len(sc) > self._HARD_CAP_BEFORE_CLUSTERING:
                         e["source_chunks"] = random.Random(0).sample(sc, self._HARD_CAP_BEFORE_CLUSTERING)
                 
-                wanted = sorted({cid for e in entities for cid in (e["source_chunks"] or [])})
+                # Track chunk statistics per batch
+                chunk_counts = [len(e["source_chunks"] or []) for e in entities]
+                chunk_count_stats = {
+                    "min": min(chunk_counts) if chunk_counts else 0,
+                    "max": max(chunk_counts) if chunk_counts else 0,
+                    "avg": sum(chunk_counts) / len(chunk_counts) if chunk_counts else 0,
+                    "total": sum(chunk_counts),
+                }
+                
 
-                chunk_lookup: dict[str, str] = {}
-                if wanted:
-                    con.register("wanted_ids", pa.table({"id": wanted}))
-                    try:
-                        rows = con.execute(
-                            "SELECT c.id, c.text "
-                            "FROM chunks c JOIN wanted_ids w USING (id)"
-                        ).fetchall()
-                    finally:
-                        con.unregister("wanted_ids")
-                    chunk_lookup = {chunk_id: text for chunk_id, text in rows}
-                    lookup_size_mb = asizeof.asizeof(chunk_lookup) / (1024 ** 2)
-                else:
-                    lookup_size_mb = 0
-
-                for e in entities:
+                for entity_idx, e in enumerate(entities):
+                    source_chunks = e["source_chunks"] or []
+                    num_chunks = len(source_chunks)
                     candidates = []
-                    for cid in (e["source_chunks"] or []):
+                    candidates_mem_start = mem()
+
+                    wanted = sorted({cid for cid in source_chunks if cid is not None})
+
+                    chunk_lookup: dict[str, str] = {}
+                    if wanted:
+                        con.register("wanted_ids", pa.table({"id": wanted}))
+                        try:
+                            rows = con.execute(
+                                "SELECT c.id, c.text "
+                                "FROM chunks c JOIN wanted_ids w USING (id)"
+                            ).fetchall()
+                        finally:
+                            con.unregister("wanted_ids")
+                        chunk_lookup = {chunk_id: text for chunk_id, text in rows}
+                        lookup_size_mb = asizeof.asizeof(chunk_lookup) / (1024 ** 2)
+                    else:
+                        lookup_size_mb = 0
+                    
+                    for cid in source_chunks:
                         text = chunk_lookup.get(cid)
                         if text is not None:
                             candidates.append({"id": cid, "text": text})
 
+                    candidates_size_mb = asizeof.asizeof(candidates) / (1024 ** 2)
+                    candidates_mem_delta = mem() - candidates_mem_start
+                    
                     excerpts = self._select_excerpts(candidates)
                     record = {
                         "id": e["id"],
@@ -543,18 +581,40 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                         "source_chunks": e["source_chunks"],
                         "excerpts": excerpts,
                     }
+                    
+                    if num_chunks > 100:  # Log only for entities with many chunks
+                        self.logger.debug(
+                            f"Entity {e['id'][:20]}... | chunks: {num_chunks} | "
+                            f"candidates: {len(candidates)} (~{candidates_size_mb:.2f} MB, Δ {candidates_mem_delta:+.3f} GB) | "
+                            f"Mem: {mem():.2f} GB"
+                        )
+                    
                     asyncio.run_coroutine_threadsafe(self.ready.put(record), loop).result()
+                    total_chunks_queued += num_chunks
+                    total_entities_queued += 1
                 
                 mem_end = mem()
                 if batch_num % 10 == 0:
-                    self.logger.debug(
-                        f"Batch {batch_num}: {len(entities)} entities (~{batch_size_mb:.1f} MB + lookup ~{lookup_size_mb:.1f} MB) | "
-                        f"Queue: {self.ready.qsize()} | Mem: {mem_end:.2f} GB (Δ {mem_end - mem_start:+.3f} GB)"
+                    queue_size = self.ready.qsize()
+                    queue_items = list(self.ready._queue) if hasattr(self.ready, '_queue') else []
+                    queue_mem_mb = sum(asizeof.asizeof(qi) for qi in queue_items) / (1024 ** 2) if queue_items else 0
+                    queue_estimate_chunks = queue_size * (chunk_count_stats["avg"] if chunk_count_stats["avg"] > 0 else 1)
+                    self.logger.info(
+                        f"Batch {batch_num}: {len(entities)} entities | "
+                        f"Chunks/entity: min={chunk_count_stats['min']}, max={chunk_count_stats['max']}, "
+                        f"avg={chunk_count_stats['avg']:.1f}, total={chunk_count_stats['total']} | "
+                        f"Queue: {queue_size} items (~{queue_estimate_chunks:.0f} chunks, {queue_mem_mb:.2f} MB) | "
+                        f"Cumulative: {total_entities_queued} entities, {total_chunks_queued} chunks | "
+                        f"Mem: {mem_end:.2f} GB (Δ {mem_end - mem_start:+.3f} GB)"
                     )
         finally:
             con.close()
         
-        self.logger.info(f"_scan phase complete | Total batches: {batch_num} | Final queue: {self.ready.qsize()} | Mem: {mem():.2f} GB")
+        self.logger.info(
+            f"_scan phase complete | Total batches: {batch_num} | "
+            f"Total queued: {total_entities_queued} entities, {total_chunks_queued} chunks | "
+            f"Final queue size: {self.ready.qsize()} items | Mem: {mem():.2f} GB"
+        )
         asyncio.run_coroutine_threadsafe(self.ready.put(None), loop).result()
 
     async def generate_descriptions(self) -> str:

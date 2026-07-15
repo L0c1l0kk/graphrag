@@ -1,4 +1,5 @@
 from collections import defaultdict
+import gc
 import logging
 import os
 
@@ -95,8 +96,6 @@ class EntityRelationExtractor:
         self._n_chunks=0
         # module-level logger
         self.logger = logging.getLogger(__name__)
-        if not logging.getLogger().handlers:
-            logging.basicConfig(level=logging.INFO)
         self.logger.debug("Initialized EntityRelationExtractor: chunk_size=%s, chunk_overlap=%s, chunks_path=%s",
                           self.chunk_size, self.chunk_overlap, self.chunks_path)
 
@@ -336,6 +335,8 @@ class EntityRelationExtractor:
                     entity_map[form] = eid
 
         del self.embed_model
+        torch.cuda.empty_cache()
+        gc.collect()
         
         entity_db=[{**entity} for entity in entity_db.values()]
         self.logger.info("Finished merging entities; created %d entity ids", len(entity_db))
