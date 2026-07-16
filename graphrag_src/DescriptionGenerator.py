@@ -16,14 +16,6 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 import polars as pl
-from pympler import asizeof
-
-import psutil
-
-process = psutil.Process(os.getpid())
-
-def mem():
-    return process.memory_info().rss / 1024**3
 
 
 class DescriptionGenerator(ABC):
@@ -60,80 +52,59 @@ class DescriptionGenerator(ABC):
                 return
             batch = self.buffer
             buffer_len = len(batch)
-            buffer_size_mb = asizeof.asizeof(batch) / (1024 ** 2)
             self.buffer = []
-        self.logger.info(f"Flushing buffer: {buffer_len} records (~{buffer_size_mb:.1f} MB) | Mem: {mem():.2f} GB")
         table= pa.table({f.name : [r[f.name] for r in batch] for f in self._SCHEMA}, schema=self._SCHEMA)
         if self.writer is None:
             self.writer = pq.ParquetWriter(self.output_path, self._SCHEMA, compression="zstd")
         self.writer.write_table(table)
-        self.logger.debug(f"Flush complete | Mem: {mem():.2f} GB")
+        self.logger.debug(f"Flush complete | Records: {buffer_len}")
 
     @abstractmethod
     def _scan(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Runs in a worker thread (see _collect). Must push fully-formed
-        record dicts onto self.ready via loop.call_soon_threadsafe, then
-        finish with a single None sentinel."""
+        """Run in a worker thread and stream entity_db in small batches.
+
+        Each batch performs one indexed lookup into chunk_db for the needed
+        chunk ids, keeping the work bounded by entity_batch_size.
+        """
 
     async def _collect(self) -> None:
-        self.logger.info(f"Starting collect phase | Mem: {mem():.2f} GB")
+        self.logger.info("Starting collect phase")
         loop = asyncio.get_running_loop()
         await asyncio.to_thread(self._scan, loop)
-        self.logger.info(f"Collect phase complete | Queue size: {self.ready.qsize()} | Mem: {mem():.2f} GB")
+        self.logger.info(f"Collect phase complete | Queue size: {self.ready.qsize()}")
 
     @abstractmethod
     async def _describe(self, record: dict, pbar: tqdm) -> None:
         pass
 
     async def _worker(self, pbar: tqdm) -> None:
-        items_processed = 0
-        chunks_processed = 0
-        self.logger.info(f"Worker started | Mem: {mem():.2f} GB")
         while True:
             item = await self.ready.get()
             if item is None:
                 await self.ready.put(None)  # re-broadcast so sibling workers also exit
-                queue_items = list(self.ready._queue) if hasattr(self.ready, '_queue') else []
-                queue_mem_mb = sum(asizeof.asizeof(qi) for qi in queue_items) / (1024 ** 2) if queue_items else 0
-                self.logger.info(
-                    f"Worker exiting | Items processed: {items_processed}, Chunks processed: {chunks_processed} | "
-                    f"Queue size: {self.ready.qsize()} items (~{queue_mem_mb:.2f} MB) | Mem: {mem():.2f} GB"
-                )
                 break
-            
+
             item_chunks = len(item.get("source_chunks") or [])
-            chunks_processed += item_chunks
-            items_processed += 1
-            queue_size = self.ready.qsize()
-            queue_items = list(self.ready._queue) if hasattr(self.ready, '_queue') else []
-            queue_mem_mb = sum(asizeof.asizeof(qi) for qi in queue_items) / (1024 ** 2) if queue_items else 0
-            
-            if items_processed % 20 == 0:  # Log every 20 items
-                self.logger.info(
-                    f"Worker progress | Items: {items_processed}, Chunks: {chunks_processed} | "
-                    f"Current item chunks: {item_chunks} | Queue remaining: {queue_size} items (~{queue_mem_mb:.2f} MB) | "
-                    f"Buffer size: {len(self.buffer)} | Mem: {mem():.2f} GB"
-                )
-            
+
             await self._describe(item, pbar)
 
     async def _consume(self, pbar: tqdm) -> None:
-        self.logger.info(f"Starting consume phase with {self.max_concurrent} workers | Mem: {mem():.2f} GB")
+        self.logger.info(f"Starting consume phase with {self.max_concurrent} workers")
         workers = [asyncio.create_task(self._worker(pbar)) for _ in range(self.max_concurrent)]
         await asyncio.gather(*workers)
-        self.logger.info(f"All workers finished | Buffer size: {len(self.buffer)} | Mem: {mem():.2f} GB")
+        self.logger.info(f"All workers finished | Buffer size: {len(self.buffer)}")
         await self._flush(force=True)
         if self.writer:
             self.writer.close()
-        self.logger.info(f"Consume phase complete | Mem: {mem():.2f} GB")
+        self.logger.info("Consume phase complete")
 
     async def generate_descriptions(self) -> str:
         if self._total is None:
             raise ValueError("Row count (self._total) not set — did the subclass set it before calling super()?")
-        self.logger.info(f"Starting description generation for {self._total} items | Mem: {mem():.2f} GB")
+        self.logger.info(f"Starting description generation for {self._total} items")
         with tqdm(total=self._total, desc="Generating descriptions") as pbar:
             await asyncio.gather(self._collect(), self._consume(pbar))
-        self.logger.info(f"Description generation complete | Output: {self.output_path} | Mem: {mem():.2f} GB")
+        self.logger.info(f"Description generation complete | Output: {self.output_path}")
         return self.output_path
     
     @staticmethod
@@ -144,9 +115,11 @@ class DescriptionGenerator(ABC):
         return max(1, len(text) // 4)
     
     def _index_is_valid(self) -> bool:
-        """True if chunk_index_path is a DuckDB file with a queryable
-        'chunks' table (i.e. a build actually completed), not just a stub
-        file that duckdb.connect() creates on disk before any table exists."""
+        """Return True when chunk_index_path contains a queryable chunks table.
+
+        This rejects stub files created by duckdb.connect() before a real
+        build has finished.
+        """
         try:
             if self._index_path is None:
                 raise ValueError("Index path not set")
@@ -179,7 +152,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         )
 
     # --- evidence-selection knobs -------------------------------------------------
-    _TOKEN_BUDGET = 4000                  # excerpts-block token budget per prompt
+    _TOKEN_BUDGET = 2000                  # excerpts-block token budget per prompt
     _MMR_LAMBDA = 0.7                     # 1.0 = pure relevance, 0.0 = pure diversity
     _MAX_CANDIDATES_FOR_MMR = 200         # cap MMR's O(k*n) cost for hub entities
     _HARD_CAP_BEFORE_CLUSTERING = 1000    # Amount of source_chunks allowed at once so no OOM happens on 16gb ram
@@ -198,7 +171,6 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         self.text_column = text_column
 
     async def _describe(self, record: dict, pbar: tqdm) -> None:
-        mem_before = mem()
         excerpts = record["excerpts"]
         if not excerpts:
             description = f"A {record['label']} named {record['canonical_name']}."
@@ -208,7 +180,6 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                 entity_type=record["label"],
                 excerpts="\n---\n".join(excerpts),
             )
-            prompt_size_kb = len(prompt) / 1024
             async with self.semaphore:
                 response = await self.client.generate(
                     model=self.model,
@@ -227,10 +198,8 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                 "source_chunks":  record["source_chunks"],
             })
             buffer_len = len(self.buffer)
-        mem_after = mem()
-        mem_delta = mem_after - mem_before
         if buffer_len % 50 == 0:  # Log every 50 buffered items
-            self.logger.debug(f"Record {record['id'][:20]}... buffered | Buffer: {buffer_len} | Mem Δ: {mem_delta:+.3f} GB | Total: {mem_after:.2f} GB")
+            self.logger.debug(f"Record {record['id'][:20]}... buffered | Buffer: {buffer_len}")
         await self._flush()
         pbar.update(1)
 
@@ -248,9 +217,10 @@ class EntityDescriptionGenerator(DescriptionGenerator):
 
     @staticmethod
     def _tfidf_cluster_representatives(tfidf, k: int, seed: int = 0) -> list[int]:
-        """Cluster candidates in TF-IDF space, return the index of the real
-        candidate closest to each cluster center (a real excerpt, not a
-        synthetic average)."""
+        """Cluster candidates in TF-IDF space and return one real representative per cluster.
+
+        The representative is the candidate closest to each cluster center.
+        """
         n = tfidf.shape[0]
         k = min(k, n)
         km = MiniBatchKMeans(n_clusters=k, random_state=seed, n_init=3, batch_size=min(256, n))
@@ -267,10 +237,11 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         return representatives
 
     def _cluster_downsample(self, candidates: list[dict], k: int) -> list[dict]:
-        """For hub entities with far more mentions than could ever fit in a
-        prompt, cluster candidate texts (TF-IDF space) and keep one
-        representative per cluster, instead of letting MMR degrade into
-        O(k * n) over thousands of near-duplicate mentions."""
+        """Downsample very large candidate sets with TF-IDF clustering.
+
+        This keeps one representative per cluster so MMR stays bounded on hub
+        entities with thousands of near-duplicate mentions.
+        """
         if len(candidates) > self._HARD_CAP_BEFORE_CLUSTERING:
             rng = random.Random(0)
             candidates = rng.sample(candidates, self._HARD_CAP_BEFORE_CLUSTERING)
@@ -280,14 +251,10 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         return [candidates[i] for i in rep_indices]
 
     def _select_excerpts(self, candidates: list[dict]) -> list[str]:
-        """MMR selection under a token budget, in TF-IDF space.
+        """Select excerpts with MMR under a token budget in TF-IDF space.
 
-        candidates: [{"id", "text"}, ...] for every chunk that mentions
-        this entity.
-
-        "Relevance" is similarity to the centroid of the entity's own
-        candidate texts — prefer excerpts representative of how the entity is
-        typically discussed, then diversify away from what's already picked.
+        Relevance is similarity to the centroid of the entity's own texts,
+        and the score then diversifies away from already selected excerpts.
         """
         if not candidates:
             return []
@@ -296,9 +263,6 @@ class EntityDescriptionGenerator(DescriptionGenerator):
 
         if len(candidates) > self._MAX_CANDIDATES_FOR_MMR:
             candidates = self._cluster_downsample(candidates, self._MAX_CANDIDATES_FOR_MMR)
-
-        candidates_size_mb = asizeof.asizeof(candidates) / (1024 ** 2)
-        self.logger.debug(f"MMR selection: {len(candidates)} candidates (~{candidates_size_mb:.1f} MB) | Mem: {mem():.2f} GB")
 
         tfidf = self._tfidf([c["text"] for c in candidates])
         # Bounded to <= _MAX_CANDIDATES_FOR_MMR rows, so a dense pairwise
@@ -343,11 +307,10 @@ class EntityDescriptionGenerator(DescriptionGenerator):
 
     @staticmethod
     def _detect_input_format(input_path: str) -> str:
-        """Best-effort sniff of whether input_path is a Parquet source or an
-        Arrow source (a single memory-mapped .arrow file, or a directory of
-        .arrow shards — the on-disk layout HF `datasets` uses for things
-        like wiki_dpr). Pass input_format="parquet"/"arrow" explicitly to
-        skip this and avoid any guessing."""
+        """Best-effort sniff whether input_path is Parquet or Arrow.
+
+        Pass input_format explicitly to skip guessing.
+        """
         p = Path(input_path)
         if p.is_dir():
             return "arrow" if any(p.glob("*.arrow")) else "parquet"
@@ -355,10 +318,10 @@ class EntityDescriptionGenerator(DescriptionGenerator):
 
     @staticmethod
     def _read_arrow_file(path: Path) -> pa.Table:
-        """Zero-copy read of a single memory-mapped .arrow file. Tries the
-        random-access IPC File format first (has a footer), falling back to
-        the sequential IPC Stream format — different `datasets` versions
-        have written either, and this way we don't need to know which."""
+        """Read a single memory-mapped .arrow file without copying buffers.
+
+        Try the IPC file format first, then fall back to the IPC stream format.
+        """
         mm = pa.memory_map(str(path), "r")
         try:
             return pa.ipc.open_file(mm).read_all()
@@ -367,21 +330,10 @@ class EntityDescriptionGenerator(DescriptionGenerator):
             return pa.ipc.open_stream(mm).read_all()
 
     def _load_arrow_source(self, input_path: str) -> pa.Table:
-        """Load a single .arrow file or a directory of shards (e.g. a
-        wiki_dpr cache dir) into one Table. Shards are memory-mapped and
-        concatenated without copying the underlying buffers.
+        """Load one .arrow file or a shard directory into a single Table.
 
-        A naive glob of *.arrow in an HF `datasets` save_to_disk directory
-        can also pick up unrelated cache-*.arrow files that `datasets`
-        leaves behind from earlier .map()/index-building calls run against
-        the same cache dir. Those have whatever schema that earlier
-        operation produced (e.g. a lone "indices" column) and blow up
-        pa.concat_tables when mixed with the real id/text/title shards.
-        To avoid that: prefer the exact file list recorded in state.json
-        (the source of truth for which files belong to the dataset) when
-        present, and otherwise fall back to filtering the glob results down
-        to shards that actually contain chunk_id_column/text_column,
-        logging a warning for anything skipped.
+        Prefer state.json when available, and otherwise skip shard files that
+        do not contain the required chunk_id_column and text_column fields.
         """
         p = Path(input_path)
         if not p.is_dir():
@@ -425,31 +377,10 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         return tables[0] if len(tables) == 1 else pa.concat_tables(tables)
 
     def _ensure_chunk_index(self) -> str:
-        """One-time cost: materialize chunk_db into a persistent, indexed
-        DuckDB table so later batched lookups are index probes against a
-        ~21M-row table, not a full join+sort of it. Reused across runs.
+        """Materialize chunk_db into a persistent indexed DuckDB table.
 
-        Assumes chunk_db (self.input_path) has a chunk-id column and a text
-        column (named "id"/"text" by default — override via
-        chunk_id_column/text_column, e.g. for wiki_dpr's "id"/"text").
-        Source can be Parquet (self.input_format == "parquet", the original
-        behavior) or Arrow (self.input_format == "arrow"; a single .arrow
-        file or a directory of shards, memory-mapped and registered with
-        DuckDB directly — no conversion to Parquet needed).
-
-        (No embedding column needed — evidence selection runs on TF-IDF
-        vectors fit locally per entity, not on precomputed chunk embeddings.)
-
-        Builds are atomic: duckdb.connect() creates a file on disk the
-        moment you connect, before any table exists, so a build that dies
-        partway through (a raised exception, or an OOM kill on a 21M-row
-        table with only 16GB RAM) can leave a stub/partial .duckdb file
-        sitting at chunk_index_path. A bare os.path.exists() check can't
-        tell that apart from a finished index, and a later run would skip
-        straight to querying a "chunks" table that was never created. To
-        avoid that: any existing file is validated (and rebuilt if it's
-        just a stub), and new builds happen in a temp file that's only
-        renamed into place after the table + index both succeed.
+        This is built atomically, reused across runs, and supports either
+        Parquet or Arrow inputs without needing an embedding column.
         """
         if os.path.exists(self._index_path) and not self._index_is_valid():
             self.logger.warning(
@@ -496,23 +427,15 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         return self._index_path
 
     def _scan(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Runs in a worker thread (see DescriptionGenerator._collect).
+        """Run in a worker thread and stream entity_db in small batches.
 
-        Streams entity_db in small batches via pyarrow (bounded memory — never
-        materializes the full entity_db as Python objects), and for each batch
-        does one indexed lookup into chunk_db for just the chunk_ids that batch
-        needs. This replaces a global (entity, chunk) join: instead of sorting
-        the whole edge list with heavy text/embedding payloads attached (which
-        wouldn't fit comfortably in 16GB), we do many small, index-assisted
-        lookups, each bounded by entity_batch_size.
-
-        Assumes entity_db (self.entity_db_path) has columns:
-        id, canonical_name, label, source_chunks (list<string>).
+        Each batch performs one indexed lookup into chunk_db for the needed
+        chunk ids, keeping the work bounded by entity_batch_size.
         """
         chunk_db = self._ensure_chunk_index()
         con = duckdb.connect(chunk_db, read_only=True)
         con.execute("PRAGMA memory_limit='6GB'")
-        self.logger.info(f"_scan started | Chunk index: {chunk_db} | Mem: {mem():.2f} GB")
+        self.logger.info(f"_scan started | Chunk index: {chunk_db}")
 
         try:
             pf = pq.ParquetFile(self.entity_db_path)
@@ -524,7 +447,6 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                 columns=["id", "canonical_name", "label", "source_chunks"],
             ):
                 batch_num += 1
-                mem_start = mem()
                 entities = batch.to_pylist()
 
                 for e in entities:
@@ -540,13 +462,11 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                     "avg": sum(chunk_counts) / len(chunk_counts) if chunk_counts else 0,
                     "total": sum(chunk_counts),
                 }
-                
 
                 for entity_idx, e in enumerate(entities):
                     source_chunks = e["source_chunks"] or []
                     num_chunks = len(source_chunks)
                     candidates = []
-                    candidates_mem_start = mem()
 
                     wanted = sorted({cid for cid in source_chunks if cid is not None})
 
@@ -561,18 +481,12 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                         finally:
                             con.unregister("wanted_ids")
                         chunk_lookup = {chunk_id: text for chunk_id, text in rows}
-                        lookup_size_mb = asizeof.asizeof(chunk_lookup) / (1024 ** 2)
-                    else:
-                        lookup_size_mb = 0
-                    
+
                     for cid in source_chunks:
                         text = chunk_lookup.get(cid)
                         if text is not None:
                             candidates.append({"id": cid, "text": text})
 
-                    candidates_size_mb = asizeof.asizeof(candidates) / (1024 ** 2)
-                    candidates_mem_delta = mem() - candidates_mem_start
-                    
                     excerpts = self._select_excerpts(candidates)
                     record = {
                         "id": e["id"],
@@ -581,31 +495,25 @@ class EntityDescriptionGenerator(DescriptionGenerator):
                         "source_chunks": e["source_chunks"],
                         "excerpts": excerpts,
                     }
-                    
+
                     if num_chunks > 100:  # Log only for entities with many chunks
                         self.logger.debug(
                             f"Entity {e['id'][:20]}... | chunks: {num_chunks} | "
-                            f"candidates: {len(candidates)} (~{candidates_size_mb:.2f} MB, Δ {candidates_mem_delta:+.3f} GB) | "
-                            f"Mem: {mem():.2f} GB"
+                            f"candidates: {len(candidates)}"
                         )
-                    
+
                     asyncio.run_coroutine_threadsafe(self.ready.put(record), loop).result()
                     total_chunks_queued += num_chunks
                     total_entities_queued += 1
-                
-                mem_end = mem()
+
                 if batch_num % 10 == 0:
                     queue_size = self.ready.qsize()
-                    queue_items = list(self.ready._queue) if hasattr(self.ready, '_queue') else []
-                    queue_mem_mb = sum(asizeof.asizeof(qi) for qi in queue_items) / (1024 ** 2) if queue_items else 0
-                    queue_estimate_chunks = queue_size * (chunk_count_stats["avg"] if chunk_count_stats["avg"] > 0 else 1)
                     self.logger.info(
                         f"Batch {batch_num}: {len(entities)} entities | "
                         f"Chunks/entity: min={chunk_count_stats['min']}, max={chunk_count_stats['max']}, "
                         f"avg={chunk_count_stats['avg']:.1f}, total={chunk_count_stats['total']} | "
-                        f"Queue: {queue_size} items (~{queue_estimate_chunks:.0f} chunks, {queue_mem_mb:.2f} MB) | "
-                        f"Cumulative: {total_entities_queued} entities, {total_chunks_queued} chunks | "
-                        f"Mem: {mem_end:.2f} GB (Δ {mem_end - mem_start:+.3f} GB)"
+                        f"Queue: {queue_size} items | "
+                        f"Cumulative: {total_entities_queued} entities, {total_chunks_queued} chunks"
                     )
         finally:
             con.close()
@@ -613,7 +521,7 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         self.logger.info(
             f"_scan phase complete | Total batches: {batch_num} | "
             f"Total queued: {total_entities_queued} entities, {total_chunks_queued} chunks | "
-            f"Final queue size: {self.ready.qsize()} items | Mem: {mem():.2f} GB"
+            f"Final queue size: {self.ready.qsize()} items"
         )
         asyncio.run_coroutine_threadsafe(self.ready.put(None), loop).result()
 
@@ -673,10 +581,9 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
         
         
     def _ensure_entity_index(self) -> str:
-        """One-time cost: materialize entity_db into a persistent, indexed
-        DuckDB table so later batched lookups are index probes.
+        """Materialize entity_db into a persistent indexed DuckDB table.
 
-        Assumes entity_db (entity_path) has columns: id, canonical_name, label, description.
+        This is a one-time build for later batched lookups.
         """
         if os.path.exists(self._index_path) and not self._index_is_valid():
             self.logger.warning(
@@ -701,7 +608,7 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
         return self._index_path
     
     def _get_top_k_by_degree(self, cluster_id: str, input_path: str, k: int) -> pl.DataFrame:
-        """Compute top k relationships by degree (in + out) weighted by edge weights for a given community."""
+        """Compute the top-k relationships for a community by weighted degree."""
         in_degree_df = pl.scan_parquet(input_path+f"_community_{cluster_id}_relations.parquet") \
             .group_by("tail") \
             .agg((pl.col("weight").sum()/pl.count("head")).alias("in_degree")) \
@@ -728,10 +635,8 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
     def _discover_community_ids(self) -> list[int]:
         """Find cluster ids from the community relation Parquet files on disk.
 
-        Path.glob() only supports shell-glob syntax, not regex, and
-        self.input_path is a file-prefix rather than a directory — so this
-        globs the actual filename pattern in the parent directory and pulls
-        the ids out with a real regex.
+        This globs the filename pattern in the parent directory and extracts
+        the ids with a regex because self.input_path is a file prefix.
         """
         base = Path(self.input_path)
         name_pattern = re.compile(r"^_community_(\d+)_relations\.parquet$")
