@@ -268,7 +268,7 @@ class EntityRelationExtractor:
             .collect()
         )
     
-    def _merge_entities(self, entities_df: pl.DataFrame, sim_threshold: float = 0.9) -> tuple[Dict[str, Dict], Dict[str, str]]:
+    def _merge_entities(self, entities_df: pl.DataFrame, sim_threshold: float = 0.8) -> tuple[Dict[str, Dict], Dict[str, str]]:
         entity_map:     Dict[str, str]  = {}
         entity_db:      Dict[str, Dict] = {}
         entity_counter: int             = 0
