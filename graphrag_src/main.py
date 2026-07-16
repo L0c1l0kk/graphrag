@@ -11,7 +11,7 @@ logging.basicConfig(
 )
  
  
-generator = GraphGenerator(max_concurrent=4)
+generator = GraphGenerator(max_concurrent=4, description_model_name="forced-gpu-model")
 start = time.perf_counter()
 asyncio.run(generator.generate_graph())
 elapsed = time.perf_counter() - start
