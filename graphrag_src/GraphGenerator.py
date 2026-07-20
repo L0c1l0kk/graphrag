@@ -135,6 +135,7 @@ class GraphGenerator:
         right_on: str,
         value_col: str,
         new_column_name: str,
+        null_placeholder: int | None = None,
     ) -> None:
         """Join one column from ``join_df`` into the parquet file at ``path``.
 
@@ -148,6 +149,8 @@ class GraphGenerator:
                 pa.field("cluster_id",     pa.int64()),
             ])
 
+        entities excluded from clustering (due to degree 0 for example) get a cluster_id of -1.
+
         The file is rewritten atomically by writing to a temporary parquet file
         first and then replacing the original on success.
         """
@@ -157,6 +160,9 @@ class GraphGenerator:
             right_on=right_on,
             how="left",
         )
+        if(null_placeholder is not None):
+            lazy_df = lazy_df.fill_null(null_placeholder)
+
         temp_path = f"{path}.tmp"
         try:
             lazy_df.sink_parquet(temp_path)
@@ -167,8 +173,10 @@ class GraphGenerator:
             raise e
     
     def _compute_clusters(self, graph: ig.Graph) -> None:
-        self.logger.info("Computing clusters: rss=%.1f MB", self._format_rss_mb())
-        
+
+        isolated_indices = [v.index for v in graph.vs if v.degree() == 0]
+        graph.delete_vertices(isolated_indices)
+
         clustering = graph.community_leiden(
             objective_function="modularity", # switch to CPM
             n_iterations=2,
@@ -188,11 +196,12 @@ class GraphGenerator:
             right_on="id",
             value_col="cluster_id",
             new_column_name="cluster_id",
+            null_placeholder=-1,
         )
         self.logger.info("Clusters computed and saved in %s", self.ENTITIES_PATH)
         
     def _relations_for_community(self, entity_path: str, relation_path: str, communities_path: str):
-        for cluster_id in pl.scan_parquet(entity_path).select("cluster_id").unique().collect().to_series():
+        for cluster_id in pl.scan_parquet(entity_path).select("cluster_id").unique().collect().to_series().filter(pl.col("cluster_id") != -1):
             members = (
                 pl.scan_parquet(entity_path)
                 .filter(pl.col("cluster_id") == cluster_id)
