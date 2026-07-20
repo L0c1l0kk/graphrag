@@ -201,7 +201,7 @@ class GraphGenerator:
         self.logger.info("Clusters computed and saved in %s", self.ENTITIES_PATH)
         
     def _relations_for_community(self, entity_path: str, relation_path: str, communities_path: str):
-        for cluster_id in pl.scan_parquet(entity_path).select("cluster_id").unique().collect().to_series().filter(pl.col("cluster_id") != -1):
+        for cluster_id in pl.scan_parquet(entity_path).select("cluster_id").filter(pl.col("cluster_id") != -1).unique().collect().to_series():
             members = (
                 pl.scan_parquet(entity_path)
                 .filter(pl.col("cluster_id") == cluster_id)
