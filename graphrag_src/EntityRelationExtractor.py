@@ -176,8 +176,6 @@ class EntityRelationExtractor:
 
         results = []
         for item, entities, relations in zip(batch, entities_all, relations_all):
-            # Cap to bound the quadratic RE pair-enumeration cost.
-            entities = entities[: self.max_entities_per_chunk]
 
             results.append({
                 "chunk_id":  item["id"],
