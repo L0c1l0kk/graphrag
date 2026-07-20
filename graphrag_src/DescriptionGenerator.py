@@ -152,10 +152,10 @@ class EntityDescriptionGenerator(DescriptionGenerator):
         )
 
     # --- evidence-selection knobs -------------------------------------------------
-    _TOKEN_BUDGET = 2000                  # excerpts-block token budget per prompt
+    _TOKEN_BUDGET = 4000                  # excerpts-block token budget per prompt
     _MMR_LAMBDA = 0.7                     # 1.0 = pure relevance, 0.0 = pure diversity
     _MAX_CANDIDATES_FOR_MMR = 200         # cap MMR's O(k*n) cost for hub entities
-    _HARD_CAP_BEFORE_CLUSTERING = 1000    # Amount of source_chunks allowed at once so no OOM happens on 16gb ram
+    _HARD_CAP_BEFORE_CLUSTERING = 5000    # Amount of source_chunks allowed at once so no OOM happens on 16gb ram
 
     def __init__(self, *args, chunk_index_path: str | None = None, entity_batch_size: int = 500,
                  input_format: str | None = None, chunk_id_column: str = "id",
@@ -643,7 +643,7 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
         ids = []
         for f in base.glob("_community_*_relations.parquet"):
             m = name_pattern.match(f.name)
-            if m:
+            if m and int(m.group(1)) !=- 1:
                 ids.append(int(m.group(1)))
         return sorted(ids)
 
