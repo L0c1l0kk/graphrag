@@ -539,11 +539,12 @@ class CommunityDescriptionGenerator(DescriptionGenerator):
             pa.field("description",     pa.string()),
         ])
     _PROMPT = (
-            'You are an information extraction assistant. Based on the following entities and entity descriptions, and relationships between them, '
-            'write a description of the entity cluster "{cluster_id}".\n'
+            'You are an information extraction assistant. Your task is to write descriptions for entity clusters, based on the entities it contains and their descriptions, and the relationships between them. '
             'Focus only on factual information directly supported by the excerpts. '
             'Your response must only contain the description text, without any additional commentary or formatting.'
             'Be specific and avoid generic statements.\n\n'
+            'The relationships and entity descriptions you are given are all from the cluster "{cluster_id}".'
+            'Write a description for the entity cluster "{cluster_id}".\n'
             'Relationships with entity descriptions:\n{relationships}\n\n'
             'Description of "{cluster_id}":'
         )
